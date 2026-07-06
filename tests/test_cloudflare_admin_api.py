@@ -53,6 +53,29 @@ class CloudflareAdminCreateTests(unittest.TestCase):
         self.assertEqual(captured["headers"]["Content-Type"], "application/json")
         self.assertEqual(captured["headers"]["x-admin-auth"], "admin-secret")
 
+    def test_app_keeps_anonymous_new_address_with_none_auth(self):
+        app.config.update({
+            "cloudflare_api_key": "",
+            "cloudflare_auth_mode": "none",
+            "cloudflare_path_accounts": "/api/new_address",
+            "defaultDomains": "vitassk.com",
+        })
+        captured = {}
+
+        def fake_post(url, **kwargs):
+            captured["url"] = url
+            captured.update(kwargs)
+            return DummyResponse({"address": "anon@vitassk.com", "jwt": "anon-jwt"})
+
+        with patch.object(app, "http_post", side_effect=fake_post):
+            address, jwt = app.cloudflare_create_temp_address("https://temp-mail.ikun.day")
+
+        self.assertEqual(address, "anon@vitassk.com")
+        self.assertEqual(jwt, "anon-jwt")
+        self.assertEqual(captured["url"], "https://temp-mail.ikun.day/api/new_address")
+        self.assertEqual(captured["json"], {"domain": "vitassk.com"})
+        self.assertEqual(captured["headers"], {"Content-Type": "application/json"})
+
     def test_debug_tool_can_create_address_through_admin_api(self):
         captured = {}
 
