@@ -14,6 +14,9 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
+from outlook_mail import redact_secrets
+from safe_io import append_text_locked
+
 if getattr(sys, 'frozen', False):
     exe_dir = Path(sys.executable).resolve().parent
     if exe_dir.name.lower() == "dist":
@@ -80,6 +83,7 @@ def export_cpa_xai_for_account(
     sso: str | None = None,
     config: dict | None = None,
     log_callback: Callable[[str], None] | None = None,
+    cancel_callback: Callable[[], bool] | None = None,
 ) -> dict:
     """Mint OIDC + write xai-<email>.json under register cpa_auths (and optional CPA auth-dir)."""
     cfg = config or {}
@@ -187,6 +191,7 @@ def export_cpa_xai_for_account(
         reuse_browser=reuse_browser,
         recycle_every=recycle_every,
         log=_log,
+        cancel=cancel_callback,
     )
 
     # Navigate registration browser back to blank after reuse
@@ -220,8 +225,12 @@ def export_cpa_xai_for_account(
     # failure log under register dir
     if not result.get("ok"):
         fail_path = out_dir / "cpa_auth_failed.txt"
-        with open(fail_path, "a", encoding="utf-8") as f:
-            f.write(f"{email}----{result.get('error') or 'unknown'}----{int(time.time())}\n")
+        safe_error = redact_secrets(str(result.get("error") or "unknown"))
+        append_text_locked(
+            fail_path,
+            f"{email}----{safe_error}----{int(time.time())}\n",
+            mode=0o600,
+        )
         if cfg.get("cpa_mint_required", False):
             raise RuntimeError(f"CPA mint required but failed: {result.get('error')}")
 

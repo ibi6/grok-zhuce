@@ -1,5 +1,7 @@
 import unittest
+import tempfile
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from unittest.mock import Mock
 
 from outlook_mail import (
@@ -8,6 +10,7 @@ from outlook_mail import (
     OutlookAuthError,
     exchange_access_token,
     extract_code,
+    load_accounts,
     parse_accounts_text,
     redact_secrets,
 )
@@ -26,6 +29,11 @@ class OutlookMailTests(unittest.TestCase):
     def test_parse_csv_accounts(self):
         text = "email,password,client_id,refresh_token\na@hotmail.com,p,c,r\n"
         self.assertEqual(parse_accounts_text(text, ".csv")[0].client_id, "c")
+
+    def test_duplicate_email_is_rejected(self):
+        text = "a@outlook.com----p----c----r\nA@outlook.com----p2----c2----r2\n"
+        with self.assertRaisesRegex(ValueError, "重复邮箱"):
+            parse_accounts_text(text)
 
     def test_redacts_secrets(self):
         self.assertNotIn("secret-value", redact_secrets("refresh_token=secret-value", "secret-value"))
@@ -57,6 +65,38 @@ class OutlookMailTests(unittest.TestCase):
         account = OutlookAccount("a@outlook.com", client_id="c", refresh_token="old")
         self.assertEqual(exchange_access_token(account, session=session), "access")
         self.assertEqual(account.refresh_token, "rotated")
+
+    def test_rotated_refresh_token_persists_to_txt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "accounts.txt"
+            path.write_text(
+                "# keep\na@outlook.com----p----c----old\nb@outlook.com----p2----c2----other\n",
+                encoding="utf-8",
+            )
+            pool = OutlookAccountPool(load_accounts(str(path)), path=str(path))
+            account = pool.get("a@outlook.com")
+            account.refresh_token = "rotated"
+            pool.persist_refresh_token(account)
+            updated = path.read_text(encoding="utf-8")
+            self.assertIn("a@outlook.com----p----c----rotated", updated)
+            self.assertIn("b@outlook.com----p2----c2----other", updated)
+
+    def test_rotated_refresh_token_persists_to_csv(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "accounts.csv"
+            path.write_text(
+                "email,password,client_id,refresh_token\n"
+                "a@outlook.com,p,c,old\n"
+                "b@outlook.com,p2,c2,other\n",
+                encoding="utf-8",
+            )
+            pool = OutlookAccountPool(load_accounts(str(path)), path=str(path))
+            account = pool.get("a@outlook.com")
+            account.refresh_token = "rotated"
+            pool.persist_refresh_token(account)
+            updated = path.read_text(encoding="utf-8")
+            self.assertIn("a@outlook.com,p,c,rotated", updated)
+            self.assertIn("b@outlook.com,p2,c2,other", updated)
 
     def test_mail_reader_skips_old_verification_code(self):
         from outlook_mail import wait_for_verification_code

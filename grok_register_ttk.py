@@ -32,8 +32,16 @@ os.environ.setdefault("TK_SILENCE_DEPRECATION", "1")
 from DrissionPage import Chromium, ChromiumOptions
 from DrissionPage.errors import PageDisconnectedError
 from curl_cffi import requests
-from outlook_mail import OutlookAuthError, OutlookError, get_pool, wait_for_verification_code
+from outlook_mail import OutlookAuthError, OutlookError, get_pool, redact_secrets, wait_for_verification_code
 from modern_ui import ModernUIBuilder, create_root
+from proxy_pool import (
+    NoProxyAvailable,
+    ProxyConnectionError,
+    ProxyPoolManager,
+    is_proxy_connection_error,
+    redact_proxy_url,
+)
+from safe_io import append_text_locked, atomic_write_json, resolve_file_path, update_json_locked
 
 
 if getattr(sys, 'frozen', False):
@@ -65,9 +73,17 @@ DEFAULT_CONFIG = {
     "cloudflare_path_accounts": "/api/new_address",
     "cloudflare_path_token": "/api/token",
     "cloudflare_path_messages": "/api/mails",
-    "proxy": "http://127.0.0.1:7890",
+    "proxy": "",
+    "proxy_pool": [],
+    "proxy_pool_selected": "",
+    "proxy_check_url": "https://accounts.x.ai/",
+    "proxy_failure_threshold": 2,
+    "proxy_cooldown_seconds": 300,
     "enable_nsfw": True,
     "register_count": 1,
+    "concurrency": 1,
+    "browser_headless": False,
+    "browser_minimized": False,
     "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
     "grok2api_auto_add_local": True,
     "grok2api_local_token_file": "",
@@ -93,7 +109,6 @@ DEFAULT_CONFIG = {
     "cpa_server_password": "",
     "cpa_server_auth_dir": "",
     "token_only_file": "",
-    "browser_minimized": False,
     "outlook_credentials_file": "",
 }
 
@@ -101,6 +116,9 @@ config = DEFAULT_CONFIG.copy()
 _cf_domain_index = 0
 _outlook_leases = {}
 _outlook_leases_lock = threading.Lock()
+_proxy_pool_manager = None
+_active_task_proxy = ""
+_config_load_error = ""
 
 
 class RegistrationCancelled(Exception):
@@ -111,22 +129,43 @@ class AccountRetryNeeded(Exception):
     pass
 
 
+def redact_sensitive_text(text, *extra_secrets):
+    secret_values = list(extra_secrets)
+    for key, value in config.items():
+        key_lower = str(key).lower()
+        is_secret_key = key_lower.endswith(
+            ("_password", "_api_key", "_app_key", "_jwt", "_access_token", "_refresh_token")
+        ) or key_lower in {"password", "api_key", "app_key", "jwt", "access_token", "refresh_token"}
+        if is_secret_key:
+            if isinstance(value, str) and value:
+                secret_values.append(value)
+    return redact_secrets(str(text or ""), *secret_values)
+
+
 def load_config():
-    global config
+    global config, _config_load_error
+    _config_load_error = ""
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 loaded = json.load(f)
             config = {**DEFAULT_CONFIG, **loaded}
-        except Exception:
+        except Exception as exc:
+            _config_load_error = str(exc)
+            backup = f"{CONFIG_FILE}.invalid-{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.bak"
+            try:
+                import shutil
+                shutil.copy2(CONFIG_FILE, backup)
+                print(f"配置读取失败，原文件已备份到: {backup}: {exc}")
+            except Exception:
+                print(f"配置读取失败，已使用默认配置: {exc}")
             config = DEFAULT_CONFIG.copy()
     return config
 
 
 def save_config():
     try:
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(config, f, indent=4, ensure_ascii=False)
+        atomic_write_json(CONFIG_FILE, config, indent=4, mode=0o600)
     except Exception as e:
         print(f"保存配置失败: {e}")
 
@@ -182,6 +221,51 @@ def get_proxies():
     if proxy:
         return {"http": proxy, "https": proxy}
     return {}
+
+
+def configure_task_proxy(log_callback=None, runtime_states=None):
+    global _proxy_pool_manager, _active_task_proxy
+    _proxy_pool_manager = ProxyPoolManager.from_config(config, runtime_states=runtime_states)
+    if not _proxy_pool_manager.configured:
+        _active_task_proxy = str(config.get("proxy") or "").strip()
+        if log_callback:
+            log_callback(
+                f"[*] 当前任务网络出口: {redact_proxy_url(_active_task_proxy) if _active_task_proxy else '直连'}"
+            )
+        return _active_task_proxy
+    _active_task_proxy = _proxy_pool_manager.select()
+    config["proxy"] = _active_task_proxy
+    if log_callback:
+        log_callback(f"[*] 代理池已选择任务出口: {redact_proxy_url(_active_task_proxy)}")
+    return _active_task_proxy
+
+
+def rotate_task_proxy_after_failure(error, log_callback=None):
+    global _active_task_proxy
+    if not _proxy_pool_manager or not _active_task_proxy:
+        return False
+    if not isinstance(error, ProxyConnectionError) and not is_proxy_connection_error(
+        error, _active_task_proxy
+    ):
+        return False
+    previous = _active_task_proxy
+    next_proxy = _proxy_pool_manager.next_after_failure(previous, error)
+    _active_task_proxy = next_proxy
+    config["proxy"] = next_proxy
+    if log_callback:
+        if next_proxy == previous:
+            log_callback(f"[!] 代理连接失败，将重试当前出口: {redact_proxy_url(previous)}")
+        else:
+            log_callback(
+                f"[!] 代理连接失败，下一次完整尝试切换: "
+                f"{redact_proxy_url(previous)} -> {redact_proxy_url(next_proxy)}"
+            )
+    return True
+
+
+def mark_task_proxy_success():
+    if _proxy_pool_manager and _active_task_proxy:
+        _proxy_pool_manager.mark_success(_active_task_proxy)
 
 
 def get_duckmail_api_key():
@@ -375,38 +459,37 @@ def add_token_to_grok2api_local_pool(raw_token, email="", log_callback=None):
     token = _normalize_sso_token(raw_token)
     if not token:
         return False
-    token_file = resolve_grok2api_local_token_file()
+    token_file = resolve_file_path(resolve_grok2api_local_token_file(), _APP_DIR)
     pool_name = str(config.get("grok2api_pool_name", "ssoBasic") or "ssoBasic").strip()
     if not pool_name:
         pool_name = "ssoBasic"
-    os.makedirs(os.path.dirname(token_file), exist_ok=True)
-    data = {}
-    if os.path.exists(token_file):
-        try:
-            with open(token_file, "r", encoding="utf-8") as f:
-                data = json.load(f) or {}
-        except Exception:
+    already_exists = False
+
+    def _update(data):
+        nonlocal already_exists
+        if not isinstance(data, dict):
             data = {}
-    if not isinstance(data, dict):
-        data = {}
-    pool = data.get(pool_name)
-    if not isinstance(pool, list):
-        pool = []
-    existing = set()
-    for item in pool:
-        if isinstance(item, str):
-            existing.add(_normalize_sso_token(item))
-        elif isinstance(item, dict):
-            existing.add(_normalize_sso_token(item.get("token", "")))
-    if token in existing:
+        pool = data.get(pool_name)
+        if not isinstance(pool, list):
+            pool = []
+        existing = set()
+        for item in pool:
+            if isinstance(item, str):
+                existing.add(_normalize_sso_token(item))
+            elif isinstance(item, dict):
+                existing.add(_normalize_sso_token(item.get("token", "")))
+        if token in existing:
+            already_exists = True
+            return data
+        pool.append({"token": token, "tags": ["auto-register"], "note": email})
+        data[pool_name] = pool
+        return data
+
+    update_json_locked(token_file, _update, default={}, mode=0o600)
+    if already_exists:
         if log_callback:
             log_callback(f"[*] grok2api 本地池已存在 token: {pool_name}")
         return True
-    entry = {"token": token, "tags": ["auto-register"], "note": email}
-    pool.append(entry)
-    data[pool_name] = pool
-    with open(token_file, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
     if log_callback:
         log_callback(f"[+] 已写入 grok2api 本地池: {pool_name} ({token_file})")
     return True
@@ -547,8 +630,8 @@ def add_token_to_token_only_file(raw_token, log_callback=None):
     if not token_only_file:
         token_only_file = os.path.join(_APP_DIR, "tokens.txt")
     try:
-        with open(token_only_file, "a", encoding="utf-8") as f:
-            f.write(f"{token}\n")
+        token_only_file = resolve_file_path(token_only_file, _APP_DIR)
+        append_text_locked(token_only_file, f"{token}\n", mode=0o600)
         if log_callback:
             log_callback(f"[+] 已写入 token 文件: {token_only_file}")
         return True
@@ -589,7 +672,14 @@ def upload_to_cpa_server(local_path, log_callback=None):
         return False
 
 
-def export_cpa_xai_for_account(email, password, sso=None, log_callback=None, page=None):
+def export_cpa_xai_for_account(
+    email,
+    password,
+    sso=None,
+    log_callback=None,
+    page=None,
+    cancel_callback=None,
+):
     if not config.get("cpa_export_enabled", True):
         if log_callback:
             log_callback("[cpa] CPA 导出已禁用，跳过")
@@ -602,6 +692,7 @@ def export_cpa_xai_for_account(email, password, sso=None, log_callback=None, pag
             page=page,
             config=config,
             log_callback=log_callback,
+            cancel_callback=cancel_callback,
         )
     except Exception as exc:
         if log_callback:
@@ -609,10 +700,63 @@ def export_cpa_xai_for_account(email, password, sso=None, log_callback=None, pag
         return {"ok": False, "error": str(exc)}
 
 
+def run_cpa_export_with_timeout(
+    email,
+    password,
+    *,
+    sso=None,
+    page_obj=None,
+    log_callback=None,
+    user_cancel_callback=None,
+    timeout=None,
+    exporter=None,
+):
+    timeout = float(timeout or config.get("cpa_mint_timeout_sec", 240) or 240)
+    exporter = exporter or export_cpa_xai_for_account
+    timeout_event = threading.Event()
+    result_box = {}
+
+    def _cancelled():
+        return timeout_event.is_set() or bool(
+            user_cancel_callback and user_cancel_callback()
+        )
+
+    def _job():
+        try:
+            result_box["result"] = exporter(
+                email,
+                password,
+                sso=sso,
+                log_callback=log_callback,
+                page=page_obj,
+                cancel_callback=_cancelled,
+            )
+        except Exception as exc:
+            result_box["result"] = {"ok": False, "error": str(exc)}
+
+    worker = threading.Thread(target=_job, name="cpa-export", daemon=True)
+    worker.start()
+    worker.join(timeout=timeout)
+    if worker.is_alive():
+        timeout_event.set()
+        if log_callback:
+            log_callback(f"[!] CPA 导出超过 {int(timeout)}s，正在取消并清理")
+        worker.join(timeout=8)
+    if worker.is_alive():
+        stop_browser(log_callback=log_callback)
+        worker.join(timeout=12)
+    if worker.is_alive():
+        return {"ok": False, "error": "CPA 导出取消后仍未退出，已停止浏览器"}
+    return result_box.get("result", {"ok": False, "error": "CPA 导出未返回结果"})
+
+
 def create_browser_options():
     options = ChromiumOptions()
     options.auto_port()
     options.set_timeouts(base=1)
+    proxy = str(config.get("proxy") or "").strip()
+    if proxy:
+        options.set_proxy(proxy)
     if os.path.exists(EXTENSION_PATH):
         options.add_extension(EXTENSION_PATH)
     if config.get("browser_headless", False):
@@ -637,12 +781,10 @@ def http_get(url, **kwargs):
     try:
         return requests.get(url, **_build_request_kwargs(**kwargs))
     except Exception as exc:
-        err = str(exc)
-        # 代理不可用时自动回退为直连，避免整个流程直接失败
-        if "127.0.0.1 port 7890" in err or "Could not connect to server" in err:
-            retry_kwargs = dict(kwargs)
-            retry_kwargs["proxies"] = {}
-            return requests.get(url, **_build_request_kwargs(**retry_kwargs))
+        if get_proxies() and is_proxy_connection_error(exc, config.get("proxy", "")):
+            raise ProxyConnectionError(
+                f"代理 GET 连接失败: {redact_proxy_url(config.get('proxy', ''))}"
+            ) from exc
         raise
 
 
@@ -650,11 +792,10 @@ def http_post(url, **kwargs):
     try:
         return requests.post(url, **_build_request_kwargs(**kwargs))
     except Exception as exc:
-        err = str(exc)
-        if "127.0.0.1 port 7890" in err or "Could not connect to server" in err:
-            retry_kwargs = dict(kwargs)
-            retry_kwargs["proxies"] = {}
-            return requests.post(url, **_build_request_kwargs(**retry_kwargs))
+        if get_proxies() and is_proxy_connection_error(exc, config.get("proxy", "")):
+            raise ProxyConnectionError(
+                f"代理 POST 连接失败: {redact_proxy_url(config.get('proxy', ''))}"
+            ) from exc
         raise
 
 
@@ -1118,6 +1259,8 @@ def get_oai_code(
                 poll_interval=poll_interval,
                 log_callback=log_callback,
                 cancel_callback=cancel_callback,
+                persist_callback=pool.persist_refresh_token,
+                proxies=get_proxies(),
             )
             release_outlook_lease("success")
             return code
@@ -2717,19 +2860,32 @@ return String(cfInput.value || '').trim().length;
         f"等待超时：未获取到 sso cookie。已看到 cookies: {sorted(last_seen_names)}"
     )
 
-def multiprocessing_worker(worker_id, count, config_data, accounts_output_file, log_queue):
+def multiprocessing_worker(
+    worker_id,
+    count,
+    config_data,
+    accounts_output_file,
+    log_queue,
+    stop_event=None,
+    proxy_runtime_states=None,
+):
     global config
     config.update(config_data)
 
     def w_log(message):
         timestamp = datetime.datetime.now().strftime("%H:%M:%S")
-        log_queue.put(f"[{timestamp}] [并发-{worker_id}] {message}")
+        log_queue.put(f"[{timestamp}] [并发-{worker_id}] {redact_sensitive_text(message)}")
 
     import sys
     current_module = sys.modules[__name__]
     setattr(current_module, 'cli_log', w_log)
 
-    run_registration_cli(count, accounts_output_file=accounts_output_file)
+    run_registration_cli(
+        count,
+        accounts_output_file=accounts_output_file,
+        external_stop_event=stop_event,
+        proxy_runtime_states=proxy_runtime_states,
+    )
 
 
 class GrokRegisterGUI(ModernUIBuilder):
@@ -2967,7 +3123,7 @@ class GrokRegisterGUI(ModernUIBuilder):
 
     def log(self, message):
         timestamp = datetime.datetime.now().strftime("%H:%M:%S")
-        line = f"[{timestamp}] {message}"
+        line = f"[{timestamp}] {redact_sensitive_text(message)}"
         print(line, flush=True)
         if threading.get_ident() != self._ui_thread_id:
             self.ui_queue.put(("log", line))
@@ -2989,6 +3145,8 @@ class GrokRegisterGUI(ModernUIBuilder):
                     self._apply_stats(event[1], event[2])
                 elif kind == "running":
                     self._apply_running_ui(event[1])
+                elif kind == "proxy_states":
+                    self._apply_proxy_states(event[1])
         except queue.Empty:
             pass
         try:
@@ -3116,6 +3274,11 @@ class GrokRegisterGUI(ModernUIBuilder):
                 daemon=True,
             ).start()
         else:
+            import multiprocessing
+
+            self.log_queue = multiprocessing.Queue()
+            self.mp_stop_event = multiprocessing.Event()
+            self.root.after(100, self._poll_log_queue)
             self.log(f"[*] 配置已保存，启动并发模式。进程数: {concurrency}，总目标: {count}")
             self.log(f"[*] 成功账号将实时保存到: {self.accounts_output_file}")
             threading.Thread(
@@ -3127,29 +3290,51 @@ class GrokRegisterGUI(ModernUIBuilder):
     def run_registration_concurrently(self, total_count, concurrency):
         import multiprocessing
 
-        self.log_queue = multiprocessing.Queue()
-        self.root.after(100, self._poll_log_queue)
-
         base = total_count // concurrency
         rem = total_count % concurrency
         self.workers = []
+        proxy_runtime_states = {
+            url: vars(state).copy()
+            for url, state in getattr(self, "_proxy_runtime_states", {}).items()
+        }
 
         for i in range(concurrency):
             c = base + (1 if i < rem else 0)
             if c > 0:
                 p = multiprocessing.Process(
                     target=multiprocessing_worker,
-                    args=(i+1, c, config, self.accounts_output_file, self.log_queue)
+                    args=(
+                        i + 1,
+                        c,
+                        config,
+                        self.accounts_output_file,
+                        self.log_queue,
+                        self.mp_stop_event,
+                        proxy_runtime_states,
+                    ),
                 )
                 p.start()
                 self.workers.append(p)
 
+        stop_started = None
+        while any(p.is_alive() for p in self.workers):
+            for p in self.workers:
+                p.join(timeout=0.25)
+            if self.mp_stop_event.is_set():
+                stop_started = stop_started or time.time()
+                if time.time() - stop_started > 15:
+                    for p in self.workers:
+                        if p.is_alive():
+                            p.terminate()
+                    self.log("[!] 并发子进程未在 15 秒内退出，已执行兜底终止")
+                    break
+
         for p in self.workers:
-            p.join()
+            p.join(timeout=3)
 
         self.log_queue.put("ALL_DONE")
         self.log("[*] 所有并发任务结束")
-        self.root.after(0, lambda: self._set_running_ui(False))
+        self._set_running_ui(False)
 
     def _poll_log_queue(self):
         if not hasattr(self, 'log_queue'):
@@ -3176,14 +3361,16 @@ class GrokRegisterGUI(ModernUIBuilder):
     def stop_registration(self):
         self.stop_requested = True
         self.log("[!] 用户停止注册")
-        if hasattr(self, 'workers'):
-            for p in self.workers:
-                if p.is_alive():
-                    p.terminate()
-            self.log("[*] 已强行终止并发子进程")
+        if hasattr(self, "mp_stop_event"):
+            self.mp_stop_event.set()
+            self.log("[*] 已通知并发子进程安全停止；15 秒后仍未退出才会兜底终止")
 
     def run_registration(self, count):
         try:
+            configure_task_proxy(
+                log_callback=self.log,
+                runtime_states=getattr(self, "_proxy_runtime_states", None),
+            )
             start_browser(log_callback=self.log)
             self.log("[*] 浏览器已启动")
             i = 0
@@ -3210,15 +3397,14 @@ class GrokRegisterGUI(ModernUIBuilder):
                         )
                         self.log(f"[*] 邮箱: {email}")
                         if get_email_provider() != "outlook":
-                            self.log(f"[Debug] 邮箱credential(jwt): {dev_token}")
+                            self.log("[Debug] 邮箱凭证已获取（内容已脱敏）")
                         try:
-                            with open(
-                                os.path.join(_APP_DIR, "mail_credentials.txt"),
-                                "a",
-                                encoding="utf-8",
-                            ) as f:
-                                if get_email_provider() != "outlook":
-                                    f.write(f"{email}\t{dev_token}\n")
+                            if get_email_provider() != "outlook":
+                                append_text_locked(
+                                    os.path.join(_APP_DIR, "mail_credentials.txt"),
+                                    f"{email}\t{dev_token}\n",
+                                    mode=0o600,
+                                )
                         except Exception:
                             pass
                         self.log("[*] 3. 拉取验证码")
@@ -3264,24 +3450,18 @@ class GrokRegisterGUI(ModernUIBuilder):
                         sleep_with_cancel(2, self.should_stop)
                     else:
                         self.log(f"[!] 账号初始化失败，将跳过 CPA 导出: {init_msg}")
-                    cpa_thread = None
-                    cpa_result_box = {}
                     _cpa_page = page if page is not None else None
                     if config.get("cpa_export_enabled", True) and init_ok:
                         self.log("[*] 7. CPA xAI 导出并验证 chat 权限")
-                        def _cpa_mint():
-                            try:
-                                cpa_result_box["result"] = export_cpa_xai_for_account(
-                                    email, profile.get("password", ""), sso=sso, log_callback=self.log, page=_cpa_page
-                                )
-                            except Exception as e:
-                                cpa_result_box["result"] = {"ok": False, "error": str(e)}
-                        cpa_thread = threading.Thread(target=_cpa_mint, daemon=True)
-                        cpa_thread.start()
-                    if cpa_thread is not None:
                         self.log("[*] 等待 CPA xAI 导出完成...")
-                        cpa_thread.join(timeout=float(config.get("cpa_mint_timeout_sec", 240) or 240))
-                        cpa_result = cpa_result_box.get("result", {"ok": False, "error": "timeout"})
+                        cpa_result = run_cpa_export_with_timeout(
+                            email,
+                            profile.get("password", ""),
+                            sso=sso,
+                            page_obj=_cpa_page,
+                            log_callback=self.log,
+                            user_cancel_callback=self.should_stop,
+                        )
                         if cpa_result.get("ok"):
                             self.log(f"[+] CPA xAI 导出成功: {cpa_result.get('path', '')}")
                         elif cpa_result.get("skipped"):
@@ -3293,13 +3473,13 @@ class GrokRegisterGUI(ModernUIBuilder):
                     self.results.append({"email": email, "sso": sso, "profile": profile})
                     try:
                         line = f"{email}----{profile.get('password','')}----{sso}\n"
-                        with open(self.accounts_output_file, "a", encoding="utf-8") as f:
-                            f.write(line)
+                        append_text_locked(self.accounts_output_file, line, mode=0o600)
                     except Exception as file_exc:
                         self.log(f"[Debug] 保存账号文件失败: {file_exc}")
                     add_token_to_grok2api_pools(sso, email=email, log_callback=self.log)
                     add_token_to_token_only_file(sso, log_callback=self.log)
                     self.success_count += 1
+                    mark_task_proxy_success()
                     retry_count_for_slot = 0
                     i += 1
                     self.log(f"[+] 注册成功: {email}")
@@ -3329,6 +3509,18 @@ class GrokRegisterGUI(ModernUIBuilder):
                         retry_count_for_slot = 0
                         i += 1
                 except Exception as exc:
+                    try:
+                        proxy_retry = rotate_task_proxy_after_failure(exc, log_callback=self.log)
+                    except NoProxyAvailable as proxy_exc:
+                        proxy_retry = False
+                        exc = proxy_exc
+                    if proxy_retry:
+                        retry_count_for_slot += 1
+                        if retry_count_for_slot <= max_slot_retry:
+                            self.log(
+                                f"[!] 当前代理连接失败，重试第 {retry_count_for_slot}/{max_slot_retry} 次: {exc}"
+                            )
+                            continue
                     self.fail_count += 1
                     retry_count_for_slot = 0
                     i += 1
@@ -3352,23 +3544,33 @@ class GrokRegisterGUI(ModernUIBuilder):
 
 
 class CliStopController:
-    def __init__(self):
+    def __init__(self, external_stop_event=None):
         self.stop_requested = False
+        self.external_stop_event = external_stop_event
 
     def should_stop(self):
-        return self.stop_requested
+        return self.stop_requested or bool(
+            self.external_stop_event and self.external_stop_event.is_set()
+        )
 
     def stop(self):
         self.stop_requested = True
+        if self.external_stop_event:
+            self.external_stop_event.set()
 
 
 def cli_log(message):
     timestamp = datetime.datetime.now().strftime("%H:%M:%S")
-    print(f"[{timestamp}] {message}", flush=True)
+    print(f"[{timestamp}] {redact_sensitive_text(message)}", flush=True)
 
 
-def run_registration_cli(count, accounts_output_file=None):
-    controller = CliStopController()
+def run_registration_cli(
+    count,
+    accounts_output_file=None,
+    external_stop_event=None,
+    proxy_runtime_states=None,
+):
+    controller = CliStopController(external_stop_event=external_stop_event)
     success_count = 0
     fail_count = 0
     retry_count_for_slot = 0
@@ -3381,6 +3583,7 @@ def run_registration_cli(count, accounts_output_file=None):
     cli_log(f"[*] 终端模式启动，目标数量: {count}")
     cli_log(f"[*] 成功账号将实时保存到: {accounts_output_file}")
     try:
+        configure_task_proxy(log_callback=cli_log, runtime_states=proxy_runtime_states)
         start_browser(log_callback=cli_log)
         cli_log("[*] 浏览器已启动")
         i = 0
@@ -3404,14 +3607,15 @@ def run_registration_cli(count, accounts_output_file=None):
                         log_callback=cli_log, cancel_callback=controller.should_stop
                     )
                     cli_log(f"[*] 邮箱: {email}")
-                    cli_log(f"[Debug] 邮箱credential(jwt): {dev_token}")
+                    if get_email_provider() != "outlook":
+                        cli_log("[Debug] 邮箱凭证已获取（内容已脱敏）")
                     try:
-                        with open(
-                            os.path.join(_APP_DIR, "mail_credentials.txt"),
-                            "a",
-                            encoding="utf-8",
-                        ) as f:
-                            f.write(f"{email}\t{dev_token}\n")
+                        if get_email_provider() != "outlook":
+                            append_text_locked(
+                                os.path.join(_APP_DIR, "mail_credentials.txt"),
+                                f"{email}\t{dev_token}\n",
+                                mode=0o600,
+                            )
                     except Exception:
                         pass
                     cli_log("[*] 3. 拉取验证码")
@@ -3457,24 +3661,18 @@ def run_registration_cli(count, accounts_output_file=None):
                     sleep_with_cancel(2, controller.should_stop)
                 else:
                     cli_log(f"[!] 账号初始化失败，将跳过 CPA 导出: {init_msg}")
-                cpa_thread = None
-                cpa_result_box = {}
                 _cpa_page = page if page is not None else None
                 if config.get("cpa_export_enabled", True) and init_ok:
                     cli_log("[*] 7. CPA xAI 导出并验证 chat 权限")
-                    def _cpa_mint_cli():
-                        try:
-                            cpa_result_box["result"] = export_cpa_xai_for_account(
-                                email, profile.get("password", ""), sso=sso, log_callback=cli_log, page=_cpa_page
-                            )
-                        except Exception as e:
-                            cpa_result_box["result"] = {"ok": False, "error": str(e)}
-                    cpa_thread = threading.Thread(target=_cpa_mint_cli, daemon=True)
-                    cpa_thread.start()
-                if cpa_thread is not None:
                     cli_log("[*] 等待 CPA xAI 导出完成...")
-                    cpa_thread.join(timeout=float(config.get("cpa_mint_timeout_sec", 240) or 240))
-                    cpa_result = cpa_result_box.get("result", {"ok": False, "error": "timeout"})
+                    cpa_result = run_cpa_export_with_timeout(
+                        email,
+                        profile.get("password", ""),
+                        sso=sso,
+                        page_obj=_cpa_page,
+                        log_callback=cli_log,
+                        user_cancel_callback=controller.should_stop,
+                    )
                     if cpa_result.get("ok"):
                         cli_log(f"[+] CPA xAI 导出成功: {cpa_result.get('path', '')}")
                     elif cpa_result.get("skipped"):
@@ -3485,13 +3683,13 @@ def run_registration_cli(count, accounts_output_file=None):
                     cli_log("[!] CPA xAI 导出已跳过，避免写入无 chat 权限的凭证")
                 try:
                     line = f"{email}----{profile.get('password','')}----{sso}\n"
-                    with open(accounts_output_file, "a", encoding="utf-8") as f:
-                        f.write(line)
+                    append_text_locked(accounts_output_file, line, mode=0o600)
                 except Exception as file_exc:
                     cli_log(f"[Debug] 保存账号文件失败: {file_exc}")
                 add_token_to_grok2api_pools(sso, email=email, log_callback=cli_log)
                 add_token_to_token_only_file(sso, log_callback=cli_log)
                 success_count += 1
+                mark_task_proxy_success()
                 retry_count_for_slot = 0
                 i += 1
                 cli_log(f"[+] 注册成功: {email}")
@@ -3516,6 +3714,18 @@ def run_registration_cli(count, accounts_output_file=None):
                     i += 1
                     cli_log(f"[-] 当前账号已达到最大重试次数，跳过: {exc}")
             except Exception as exc:
+                try:
+                    proxy_retry = rotate_task_proxy_after_failure(exc, log_callback=cli_log)
+                except NoProxyAvailable as proxy_exc:
+                    proxy_retry = False
+                    exc = proxy_exc
+                if proxy_retry:
+                    retry_count_for_slot += 1
+                    if retry_count_for_slot <= max_slot_retry:
+                        cli_log(
+                            f"[!] 当前代理连接失败，重试第 {retry_count_for_slot}/{max_slot_retry} 次: {exc}"
+                        )
+                        continue
                 fail_count += 1
                 retry_count_for_slot = 0
                 i += 1

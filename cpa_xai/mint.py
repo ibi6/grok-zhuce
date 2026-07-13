@@ -9,7 +9,7 @@ from typing import Any, Callable
 from .browser_confirm import mint_with_browser
 from .probe import probe_mini_response, probe_models
 from .proxyutil import proxy_log_label, resolve_proxy, set_runtime_proxy
-from .schema import DEFAULT_BASE_URL, build_cpa_xai_auth
+from .schema import DEFAULT_BASE_URL, build_cpa_xai_auth, credential_file_name
 from .writer import write_cpa_xai_auth
 
 LogFn = Callable[[str], None]
@@ -79,8 +79,9 @@ def mint_and_export(
         expires_in=tokens.get("expires_in"),
         base_url=base_url,
     )
-    path = write_cpa_xai_auth(auth_dir, payload)
-    log(f"wrote {path}")
+    path = Path(auth_dir).expanduser().resolve() / credential_file_name(
+        str(payload.get("email") or ""), str(payload.get("sub") or "")
+    )
 
     result: dict[str, Any] = {
         "ok": True,
@@ -121,6 +122,7 @@ def mint_and_export(
         if not result.get("ok"):
             payload["disabled"] = True
             payload["probe_error"] = result.get("error", "CPA validation failed")
-            write_cpa_xai_auth(auth_dir, payload, filename=path.name)
-            log(f"disabled unusable credential: {path}")
+            log(f"validation failed; credential will be written disabled: {path}")
+    path = write_cpa_xai_auth(auth_dir, payload, filename=path.name)
+    log(f"wrote {path}{' (disabled)' if payload.get('disabled') else ''}")
     return result

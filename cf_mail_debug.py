@@ -205,7 +205,7 @@ def main():
             name=args.name,
         )
         print(f"[NEW] address={address}")
-        print(f"[NEW] credential(jwt)={credential}")
+        print("[NEW] credential(jwt) 已获取（内容已脱敏）")
     else:
         print(f"[USE] address={address or '(unknown, from credential)'}")
 

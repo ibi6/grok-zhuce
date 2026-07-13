@@ -710,6 +710,7 @@ def _wait_turnstile(
     *,
     email: str = "",
     raise_on_timeout: bool = False,
+    cancel: Callable[[], bool] | None = None,
 ) -> bool:
     """Wait/click Cloudflare Turnstile on the mint browser page.
 
@@ -719,6 +720,8 @@ def _wait_turnstile(
     deadline = time.time() + timeout
     clicked = False
     while time.time() < deadline:
+        if cancel and cancel():
+            raise BrowserConfirmError("cancelled")
         try:
             el = page.ele("css:input[name='cf-turnstile-response']", timeout=0.3)
             if el is not None:
@@ -904,6 +907,7 @@ def approve_device_code(
     timeout_sec: float = 240.0,
     stop_event: threading.Event | None = None,
     log: LogFn | None = None,
+    cancel: Callable[[], bool] | None = None,
 ) -> None:
     log = log or _noop_log
     if page is None:
@@ -932,6 +936,11 @@ def approve_device_code(
     last_url = ""
 
     while time.time() < deadline:
+        if cancel and cancel():
+            if stop_event is not None:
+                stop_event.set()
+            log("cancel requested — leave browser loop")
+            return
         if stop_event is not None and stop_event.is_set():
             log("stop_event set — leave browser loop")
             return
@@ -1096,6 +1105,7 @@ def approve_device_code(
                 25,
                 email=email,
                 raise_on_timeout=True,
+                cancel=cancel,
             )
             _fill(page, "css:input[type='password']", password, log, "password")
             _wait_turnstile(
@@ -1104,6 +1114,7 @@ def approve_device_code(
                 12,
                 email=email,
                 raise_on_timeout=False,
+                cancel=cancel,
             )
             # REAL click login helps form submit
             if not _click_exact(page, ["登录", "Sign in", "Log in"], log, real=True):
@@ -1118,6 +1129,10 @@ def approve_device_code(
                     log(f"login submit fail: {e}")
             # wait navigation / surface error banner
             for _ in range(20):
+                if cancel and cancel():
+                    if stop_event is not None:
+                        stop_event.set()
+                    return
                 if stop_event is not None and stop_event.is_set():
                     return
                 _sleep(0.5)
@@ -1281,6 +1296,7 @@ def mint_with_browser(
                 timeout_sec=browser_timeout_sec,
                 stop_event=stop_event,
                 log=log,
+                cancel=cancel,
             )
         except BrowserConfirmError as e:
             msg = str(e)

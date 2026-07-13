@@ -46,11 +46,12 @@ Grok Register 是一个面向自动化流程研究、测试环境验证和个人
 
 ## 功能
 
-- 支持基于 CustomTkinter 的现代明亮 GUI，包含概览、注册、邮箱、CPA/Token 和设置页面。
+- 支持基于 CustomTkinter 的现代明亮 GUI，包含概览、注册、代理池、邮箱、CPA/Token 和设置页面。
 - 支持 CLI 终端运行，不启动 Tk GUI。
 - 注册流程使用 Chromium/Chrome 浏览器页面完成。
 - 支持 DuckMail、YYDS、Cloudflare 临时邮箱接口，以及已有 Outlook/Hotmail 账号的 Microsoft Graph OAuth 收信。
 - 支持验证码邮件轮询和解析。
+- 支持 HTTP/HTTPS/SOCKS5 代理列表、TXT 导入、健康检测、任务级固定出口和连接故障冷却切换。
 - 支持成功账号实时写入 `accounts_*.txt`。
 - 支持将 SSO token 写入 grok2api 本地或远端池。
 - 支持注册后尝试开启 NSFW。
@@ -58,7 +59,7 @@ Grok Register 是一个面向自动化流程研究、测试环境验证和个人
 
 ## 环境要求
 
-- Python 3.9+
+- Python 3.10+
 - Google Chrome 或 Chromium
 - 可访问注册页面和临时邮箱 API 的网络环境
 
@@ -94,7 +95,12 @@ cp config.example.json config.json
 | `email_provider` | 邮箱服务商：`duckmail`、`yyds`、`cloudflare`、`gptmail`、`outlook` |
 | `outlook_credentials_file` | 已有 Outlook 账号凭证文件；TXT 每行格式为 `email----password----client_id----refresh_token`，也支持同名列 CSV |
 | `register_count` | 本次目标注册数量 |
-| `proxy` | 代理地址，可留空 |
+| `proxy` | 单代理地址；代理池为空时使用，可留空 |
+| `proxy_pool` | 代理池数组，每项包含 `url`、`name`、`enabled` 和 `priority` |
+| `proxy_pool_selected` | 手动优先使用的代理 URL，留空时按健康状态和延迟自动选择 |
+| `proxy_check_url` | 代理健康检测地址，默认 `https://accounts.x.ai/` |
+| `proxy_failure_threshold` | 连续代理连接失败多少次后进入冷却 |
+| `proxy_cooldown_seconds` | 代理故障冷却秒数 |
 | `enable_nsfw` | 注册后是否尝试开启 NSFW |
 | `cloudflare_api_base` | Cloudflare 临时邮箱 API 地址 |
 | `cloudflare_api_key` | Cloudflare 临时邮箱接口密钥；默认匿名模式留空，admin 模式填 `ADMIN_PASSWORD` |
@@ -240,6 +246,9 @@ dist\grok_register_ttk.exe
 - CLI 模式支持 `Ctrl+C` 中断并清理浏览器。
 - 最终页长时间无变化时自动重试当前账号。
 - 验证码未收到时自动更换邮箱重试。
+- 本地 Token 池和账号输出使用跨进程文件锁，配置与 JSON 池使用原子保存。
+- Outlook OAuth 返回轮换 refresh token 时自动写回原凭证文件。
+- 配置代理后不会因代理失败静默回退直连。
 
 ## 常见问题
 
@@ -255,11 +264,17 @@ CLI 模式只是不启动 Tk GUI。注册页、Turnstile、验证码提交和 SS
 
 GUI 数量控件可能有上限。CLI 模式直接读取 `config.json` 中的 `register_count`。
 
+### Clash 或 V2Ray 怎么接入代理池？
+
+在代理池页面填写客户端提供的本地 HTTP/SOCKS5 监听地址，例如 `http://127.0.0.1:7897`。程序不下载或解析订阅链接，也不会按账号主动轮换出口；只有明确的代理连接故障才会为下一次完整尝试切换代理。
+
 ## 目录结构
 
 ```text
 .
 ├── grok_register_ttk.py   # 主程序
+├── proxy_pool.py          # 代理池、健康检测和故障冷却
+├── safe_io.py             # 原子保存与跨进程文件锁
 ├── cf_mail_debug.py       # Cloudflare 邮箱调试工具
 ├── config.example.json    # 配置示例
 ├── requirements.txt       # Python 依赖

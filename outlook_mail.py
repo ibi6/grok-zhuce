@@ -13,6 +13,9 @@ from datetime import datetime, timedelta, timezone
 from typing import Callable, Optional
 
 import requests
+from filelock import FileLock
+
+from safe_io import atomic_write_text
 
 
 TOKEN_URL = "https://login.microsoftonline.com/consumers/oauth2/v2.0/token"
@@ -26,6 +29,14 @@ class OutlookError(Exception):
 
 class OutlookAuthError(OutlookError):
     pass
+
+
+def _sleep_with_cancel(seconds: float, cancel_callback=None) -> None:
+    deadline = time.time() + max(float(seconds), 0)
+    while time.time() < deadline:
+        if cancel_callback and cancel_callback():
+            raise OutlookError("操作已取消")
+        time.sleep(min(0.25, max(deadline - time.time(), 0)))
 
 
 @dataclass
@@ -76,11 +87,13 @@ def parse_accounts_text(text: str, suffix: str = ".txt") -> list[OutlookAccount]
     if suffix.lower() == ".csv":
         reader = csv.DictReader(io.StringIO(text))
         required = {"email", "password", "client_id", "refresh_token"}
-        if not reader.fieldnames or not required.issubset({x.strip() for x in reader.fieldnames}):
+        normalized_fields = [str(x or "").strip() for x in (reader.fieldnames or [])]
+        if not normalized_fields or not required.issubset(set(normalized_fields)):
             raise ValueError("CSV 必须包含 email,password,client_id,refresh_token 列")
         for line_number, row in enumerate(reader, start=2):
             try:
-                accounts.append(_account_from_values([row.get(k, "") for k in ("email", "password", "client_id", "refresh_token")], line_number))
+                normalized_row = {str(k or "").strip(): value for k, value in row.items()}
+                accounts.append(_account_from_values([normalized_row.get(k, "") for k in ("email", "password", "client_id", "refresh_token")], line_number))
             except ValueError as exc:
                 errors.append(str(exc))
     else:
@@ -96,6 +109,15 @@ def parse_accounts_text(text: str, suffix: str = ".txt") -> list[OutlookAccount]
         raise ValueError("；".join(errors))
     if not accounts:
         raise ValueError("Outlook 凭证文件中没有账号")
+    seen = set()
+    duplicates = set()
+    for account in accounts:
+        key = account.email.lower()
+        if key in seen:
+            duplicates.add(account.email)
+        seen.add(key)
+    if duplicates:
+        raise ValueError(f"Outlook 凭证包含重复邮箱: {', '.join(sorted(duplicates))}")
     return accounts
 
 
@@ -105,8 +127,9 @@ def load_accounts(path: str) -> list[OutlookAccount]:
 
 
 class OutlookAccountPool:
-    def __init__(self, accounts: list[OutlookAccount]):
+    def __init__(self, accounts: list[OutlookAccount], path: str = ""):
         self.accounts = accounts
+        self.path = os.path.abspath(path) if path else ""
         self._lock = threading.Lock()
         self._by_email = {account.email.lower(): account for account in accounts}
 
@@ -130,18 +153,75 @@ class OutlookAccountPool:
         if account.lock.locked():
             account.lock.release()
 
+    def persist_refresh_token(self, account: OutlookAccount) -> None:
+        if not self.path:
+            return
+        path = self.path
+        suffix = os.path.splitext(path)[1].lower()
+        with FileLock(path + ".lock", timeout=30):
+            with open(path, "r", encoding="utf-8-sig", newline="") as handle:
+                original = handle.read()
+            if suffix == ".csv":
+                reader = csv.DictReader(io.StringIO(original))
+                fields = [str(field or "").strip() for field in (reader.fieldnames or [])]
+                if not fields:
+                    raise OutlookError("Outlook CSV 缺少表头")
+                rows = []
+                matched = False
+                for row in reader:
+                    normalized = {str(k or "").strip(): value for k, value in row.items()}
+                    if str(normalized.get("email") or "").strip().lower() == account.email.lower():
+                        normalized["refresh_token"] = account.refresh_token
+                        matched = True
+                    rows.append(normalized)
+                if not matched:
+                    raise OutlookError(f"Outlook 凭证文件中找不到账号: {account.email}")
+                output = io.StringIO(newline="")
+                writer = csv.DictWriter(output, fieldnames=fields, lineterminator="\n")
+                writer.writeheader()
+                writer.writerows(rows)
+                updated = output.getvalue()
+            else:
+                matched = False
+                lines = []
+                for raw_line in original.splitlines(keepends=True):
+                    newline = "\r\n" if raw_line.endswith("\r\n") else ("\n" if raw_line.endswith("\n") else "")
+                    body = raw_line[:-len(newline)] if newline else raw_line
+                    stripped = body.strip()
+                    if stripped and not stripped.startswith("#"):
+                        parts = body.split("----")
+                        if len(parts) >= 4 and parts[0].strip().lower() == account.email.lower():
+                            parts[3] = account.refresh_token
+                            body = "----".join(parts)
+                            matched = True
+                    lines.append(body + newline)
+                if not matched:
+                    raise OutlookError(f"Outlook 凭证文件中找不到账号: {account.email}")
+                updated = "".join(lines)
+            atomic_write_text(path, updated, mode=0o600)
+        with _cache_lock:
+            _pool_cache[path] = (os.path.getmtime(path), self)
 
-def exchange_access_token(account: OutlookAccount, session=requests, timeout=30) -> str:
-    response = session.post(
-        TOKEN_URL,
-        data={
+
+def exchange_access_token(
+    account: OutlookAccount,
+    session=requests,
+    timeout=30,
+    persist_callback: Optional[Callable[[OutlookAccount], None]] = None,
+    proxies: Optional[dict] = None,
+) -> str:
+    request_kwargs = {
+        "data": {
             "client_id": account.client_id,
             "grant_type": "refresh_token",
             "refresh_token": account.refresh_token,
             "scope": "https://graph.microsoft.com/.default offline_access",
         },
-        timeout=timeout,
-    )
+        "timeout": timeout,
+    }
+    if proxies:
+        request_kwargs["proxies"] = proxies
+    response = session.post(TOKEN_URL, **request_kwargs)
     try:
         payload = response.json()
     except Exception:
@@ -152,6 +232,13 @@ def exchange_access_token(account: OutlookAccount, session=requests, timeout=30)
         raise OutlookAuthError(f"{code}: {description}")
     if payload.get("refresh_token"):
         account.refresh_token = payload["refresh_token"]
+        if persist_callback:
+            try:
+                persist_callback(account)
+            except Exception as exc:
+                account.last_error = redact_secrets(
+                    f"refresh token 持久化失败: {exc}", account.password, account.refresh_token
+                )
     return payload["access_token"]
 
 
@@ -177,9 +264,16 @@ def wait_for_verification_code(
     log_callback: Optional[Callable[[str], None]] = None,
     cancel_callback: Optional[Callable[[], bool]] = None,
     session=requests,
+    persist_callback: Optional[Callable[[OutlookAccount], None]] = None,
+    proxies: Optional[dict] = None,
 ) -> str:
     attempt_started_at = datetime.now(timezone.utc) - timedelta(seconds=10)
-    access_token = exchange_access_token(account, session=session)
+    account.last_error = ""
+    access_token = exchange_access_token(
+        account, session=session, persist_callback=persist_callback, proxies=proxies
+    )
+    if account.last_error and log_callback:
+        log_callback(f"[!] {account.last_error}")
     deadline = time.time() + timeout
     headers = {"Authorization": f"Bearer {access_token}"}
     params = {
@@ -191,13 +285,16 @@ def wait_for_verification_code(
     while time.time() < deadline:
         if cancel_callback and cancel_callback():
             raise OutlookError("操作已取消")
-        response = session.get(MESSAGES_URL, headers=headers, params=params, timeout=30)
+        request_kwargs = {"headers": headers, "params": params, "timeout": 30}
+        if proxies:
+            request_kwargs["proxies"] = proxies
+        response = session.get(MESSAGES_URL, **request_kwargs)
         if response.status_code == 429:
             try:
                 delay = min(int(response.headers.get("Retry-After", poll_interval)), 30)
             except (TypeError, ValueError):
                 delay = min(int(poll_interval), 30)
-            time.sleep(delay)
+            _sleep_with_cancel(delay, cancel_callback)
             continue
         if response.status_code == 401:
             raise OutlookAuthError("Microsoft Graph access token 已失效")
@@ -223,7 +320,7 @@ def wait_for_verification_code(
             code = extract_code(message)
             if code:
                 return code
-        time.sleep(poll_interval)
+        _sleep_with_cancel(poll_interval, cancel_callback)
     raise OutlookError(f"Outlook 在 {timeout}s 内未收到验证码邮件")
 
 
@@ -238,6 +335,6 @@ def get_pool(path: str) -> OutlookAccountPool:
         cached = _pool_cache.get(absolute)
         if cached and cached[0] == mtime:
             return cached[1]
-        pool = OutlookAccountPool(load_accounts(absolute))
+        pool = OutlookAccountPool(load_accounts(absolute), path=absolute)
         _pool_cache[absolute] = (mtime, pool)
         return pool
