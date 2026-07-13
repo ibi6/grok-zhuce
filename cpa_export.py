@@ -14,7 +14,14 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-_REG_DIR = Path(__file__).resolve().parent
+if getattr(sys, 'frozen', False):
+    exe_dir = Path(sys.executable).resolve().parent
+    if exe_dir.name.lower() == "dist":
+        _REG_DIR = exe_dir.parent
+    else:
+        _REG_DIR = exe_dir
+else:
+    _REG_DIR = Path(__file__).resolve().parent
 _DEFAULT_OUT = _REG_DIR / "cpa_auths"
 _DEFAULT_CPA = Path("")  # empty = do not assume a machine-local CPA path
 

@@ -174,8 +174,10 @@ def build_cpa_xai_auth(
 
     if disabled:
         payload["disabled"] = True
-    if headers:
-        payload["headers"] = dict(headers)
+    # CPA/NewAPI forwards custom upstream headers from auth metadata.  Grok's
+    # CLI proxy rejects requests without a current client version, so every
+    # generated credential must carry the official CLI-compatible defaults.
+    payload["headers"] = dict(DEFAULT_CLIENT_HEADERS if headers is None else headers)
     if extra:
         for k, v in extra.items():
             if k not in payload:

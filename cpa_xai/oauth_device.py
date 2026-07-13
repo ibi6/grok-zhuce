@@ -20,7 +20,7 @@ CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
 ISSUER = "https://auth.x.ai"
 DEVICE_CODE_URL = "https://auth.x.ai/oauth2/device/code"
 TOKEN_URL = "https://auth.x.ai/oauth2/token"
-SCOPE = "openid profile email offline_access grok-cli:access api:access"
+SCOPE = "openid profile email offline_access grok-cli:access api:access conversations:read conversations:write"
 
 LogFn = Callable[[str], None]
 
@@ -168,7 +168,7 @@ def request_device_code(
 ) -> DeviceCodeSession:
     status, body = _post_form(
         DEVICE_CODE_URL,
-        {"client_id": client_id, "scope": scope},
+        {"client_id": client_id, "scope": scope, "referrer": "grok-build"},
         timeout=timeout,
         proxy=proxy,
         retries=2,
@@ -184,6 +184,11 @@ def request_device_code(
     vcomplete = str(
         body.get("verification_uri_complete") or f"{vuri}?user_code={user_code}"
     ).strip()
+    if "referrer=" not in vcomplete:
+        if "?" in vcomplete:
+            vcomplete += "&referrer=grok-build"
+        else:
+            vcomplete += "?referrer=grok-build"
     expires_in = int(body.get("expires_in") or 1800)
     interval = max(int(body.get("interval") or 5), 1)
     return DeviceCodeSession(
@@ -229,6 +234,7 @@ def poll_device_token(
                     "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
                     "device_code": device_code,
                     "client_id": client_id,
+                    "referrer": "grok-build",
                 },
                 timeout=timeout,
                 proxy=proxy,

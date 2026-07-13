@@ -1,4 +1,5 @@
 {
+  "gptmail_api_key": "",
   "duckmail_api_key": "",
   "cloudflare_api_base": "https://temp-mail.example.com",
   "cloudflare_api_key": "",
@@ -19,6 +20,7 @@
   "grok2api_remote_app_key": "",
   "defaultDomains": "example.com",
   "email_provider": "cloudflare",
+  "outlook_credentials_file": "outlook_accounts.txt",
   "yyds_api_key": "",
   "yyds_jwt": "",
   "cpa_export_enabled": true,

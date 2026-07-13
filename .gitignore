@@ -1,4 +1,6 @@
 __pycache__/
+build/
+dist/
 *.pyc
 *.pyo
 *.pyd
@@ -22,5 +24,6 @@ config.local.json
 .DS_Store
 .idea/
 .vscode/
+.superpowers/
 DrissionPage/
 autoPortData/

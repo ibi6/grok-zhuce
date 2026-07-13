@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python
+#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
 Grok 注册机 - TTK GUI 版本
@@ -21,14 +21,31 @@ import re
 import string
 import json
 
+if sys.platform == "win32":
+    if sys.stdout is not None:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    if sys.stderr is not None:
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+
 os.environ.setdefault("TK_SILENCE_DEPRECATION", "1")
 
 from DrissionPage import Chromium, ChromiumOptions
 from DrissionPage.errors import PageDisconnectedError
 from curl_cffi import requests
+from outlook_mail import OutlookAuthError, OutlookError, get_pool, wait_for_verification_code
+from modern_ui import ModernUIBuilder, create_root
 
 
-CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+if getattr(sys, 'frozen', False):
+    exe_dir = os.path.dirname(sys.executable)
+    if os.path.basename(exe_dir).lower() == "dist":
+        _APP_DIR = os.path.dirname(exe_dir)
+    else:
+        _APP_DIR = exe_dir
+else:
+    _APP_DIR = os.path.dirname(os.path.abspath(__file__))
+
+CONFIG_FILE = os.path.join(_APP_DIR, "config.json")
 MEMORY_CLEANUP_INTERVAL = 5
 
 UI_BG = "#242424"
@@ -76,10 +93,14 @@ DEFAULT_CONFIG = {
     "cpa_server_password": "",
     "cpa_server_auth_dir": "",
     "token_only_file": "",
+    "browser_minimized": False,
+    "outlook_credentials_file": "",
 }
 
 config = DEFAULT_CONFIG.copy()
 _cf_domain_index = 0
+_outlook_leases = {}
+_outlook_leases_lock = threading.Lock()
 
 
 class RegistrationCancelled(Exception):
@@ -153,6 +174,7 @@ EXTENSION_PATH = os.path.abspath(
 
 
 DUCKMAIL_API_BASE = "https://api.duckmail.sbs"
+GPTMAIL_API_BASE = "https://mail.chatgpt.org.uk/api"
 
 
 def get_proxies():
@@ -164,6 +186,62 @@ def get_proxies():
 
 def get_duckmail_api_key():
     return config.get("duckmail_api_key", "")
+
+
+def get_gptmail_api_key():
+    return config.get("gptmail_api_key", "")
+
+
+def gptmail_generate_email(api_key):
+    url = f"{GPTMAIL_API_BASE}/generate-email"
+    headers = {"X-API-Key": api_key, "Content-Type": "application/json"}
+    resp = http_post(url, json={}, headers=headers)
+    resp.raise_for_status()
+    data = resp.json()
+    if not data.get("success") or "email" not in data.get("data", {}):
+        raise Exception(f"GPTMail 生成邮箱失败: {resp.text}")
+    return data["data"]["email"]
+
+
+def gptmail_get_messages(api_key, email):
+    url = f"{GPTMAIL_API_BASE}/emails"
+    headers = {"X-API-Key": api_key}
+    resp = http_get(url, headers=headers, params={"email": email})
+    resp.raise_for_status()
+    data = resp.json()
+    if not data.get("success"):
+        raise Exception(f"GPTMail 拉取邮件列表失败: {resp.text}")
+    return data.get("data", {}).get("emails", [])
+
+
+def gptmail_get_oai_code(dev_token, email, timeout=180, poll_interval=3, log_callback=None, cancel_callback=None):
+    deadline = time.time() + timeout
+    seen_ids = set()
+    while time.time() < deadline:
+        raise_if_cancelled(cancel_callback)
+        try:
+            messages = gptmail_get_messages(dev_token, email)
+        except Exception as exc:
+            if log_callback:
+                log_callback(f"[Debug] 拉取 GPTMail 邮件列表失败: {exc}")
+            sleep_with_cancel(poll_interval, cancel_callback)
+            continue
+        for msg in messages:
+            msg_id = msg.get("id")
+            if not msg_id or msg_id in seen_ids:
+                continue
+            seen_ids.add(msg_id)
+            subject = msg.get("subject", "")
+            text_body = msg.get("content", "")
+            html_body = msg.get("html_content", "")
+            combined = f"{subject}\n{text_body}\n{html_body}"
+            code = extract_verification_code(combined, subject)
+            if code:
+                return code
+            if log_callback:
+                log_callback(f"[Debug] GPTMail 收到非验证码邮件: {subject}")
+        sleep_with_cancel(poll_interval, cancel_callback)
+    return None
 
 
 def get_cloudflare_api_base():
@@ -283,7 +361,7 @@ def resolve_grok2api_local_token_file():
     configured = str(config.get("grok2api_local_token_file", "") or "").strip()
     if configured:
         return configured
-    return os.path.join(os.path.dirname(__file__), "token.json")
+    return os.path.join(_APP_DIR, "token.json")
 
 
 def _normalize_sso_token(raw_token):
@@ -467,7 +545,7 @@ def add_token_to_token_only_file(raw_token, log_callback=None):
         return False
     token_only_file = str(config.get("token_only_file", "") or "").strip()
     if not token_only_file:
-        token_only_file = os.path.join(os.path.dirname(__file__), "tokens.txt")
+        token_only_file = os.path.join(_APP_DIR, "tokens.txt")
     try:
         with open(token_only_file, "a", encoding="utf-8") as f:
             f.write(f"{token}\n")
@@ -537,6 +615,10 @@ def create_browser_options():
     options.set_timeouts(base=1)
     if os.path.exists(EXTENSION_PATH):
         options.add_extension(EXTENSION_PATH)
+    if config.get("browser_headless", False):
+        options.headless(True)
+    elif config.get("browser_minimized", False):
+        options.set_argument('--window-position=-2000,-2000')
     return options
 
 
@@ -942,8 +1024,35 @@ def get_email_provider():
     return config.get("email_provider", "duckmail")
 
 
+def release_outlook_lease(status="available", error=""):
+    thread_id = threading.get_ident()
+    with _outlook_leases_lock:
+        lease = _outlook_leases.pop(thread_id, None)
+    if lease:
+        pool, account = lease
+        pool.release(account, status, error)
+
+
 def get_email_and_token(api_key=None):
     provider = get_email_provider()
+    if provider == "outlook":
+        credentials_file = str(config.get("outlook_credentials_file", "") or "").strip()
+        if not credentials_file:
+            raise Exception("Outlook 凭证文件未配置")
+        if not os.path.isabs(credentials_file):
+            credentials_file = os.path.join(_APP_DIR, credentials_file)
+        release_outlook_lease("failed", "Outlook account replaced before verification")
+        pool = get_pool(credentials_file)
+        account = pool.acquire()
+        with _outlook_leases_lock:
+            _outlook_leases[threading.get_ident()] = (pool, account)
+        return account.email, account.email
+    if provider == "gptmail":
+        key = api_key or get_gptmail_api_key()
+        if not key:
+            raise Exception("GPTMail API Key 未配置")
+        address = gptmail_generate_email(key)
+        return address, key
     if provider == "yyds":
         return yyds_get_email_and_token(api_key=api_key, jwt=get_yyds_jwt())
     if provider == "cloudflare":
@@ -996,6 +1105,38 @@ def get_oai_code(
     resend_callback=None,
 ):
     provider = get_email_provider()
+    if provider == "outlook":
+        credentials_file = str(config.get("outlook_credentials_file", "") or "").strip()
+        if not os.path.isabs(credentials_file):
+            credentials_file = os.path.join(_APP_DIR, credentials_file)
+        pool = get_pool(credentials_file)
+        account = pool.get(email)
+        try:
+            code = wait_for_verification_code(
+                account,
+                timeout=timeout,
+                poll_interval=poll_interval,
+                log_callback=log_callback,
+                cancel_callback=cancel_callback,
+            )
+            release_outlook_lease("success")
+            return code
+        except OutlookAuthError as exc:
+            release_outlook_lease("token_invalid", str(exc))
+            raise Exception(f"Outlook OAuth 已失效: {exc}") from exc
+        except OutlookError as exc:
+            status = "mail_timeout" if "未收到验证码" in str(exc) else "failed"
+            release_outlook_lease(status, str(exc))
+            raise Exception(str(exc)) from exc
+    if provider == "gptmail":
+        return gptmail_get_oai_code(
+            dev_token,
+            email,
+            timeout=timeout,
+            poll_interval=poll_interval,
+            log_callback=log_callback,
+            cancel_callback=cancel_callback,
+        )
     if provider == "yyds":
         return yyds_get_oai_code(
             dev_token,
@@ -1491,7 +1632,7 @@ def start_browser(log_callback=None):
                 log_callback(f"[Debug] 浏览器启动失败(第{attempt}/4次): {exc}")
             try:
                 if browser is not None:
-                    browser.quit(del_data=True)
+                    browser.quit()
             except Exception:
                 pass
             browser = None
@@ -1500,11 +1641,13 @@ def start_browser(log_callback=None):
     raise Exception(f"浏览器启动失败，已重试4次: {last_exc}")
 
 
-def stop_browser():
+def stop_browser(log_callback=None):
     global browser, page
     if browser is not None:
+        if log_callback:
+            log_callback("[*] 正在关闭当前浏览器实例...")
         try:
-            browser.quit(del_data=True)
+            browser.quit()
         except Exception:
             pass
     browser = None
@@ -1512,7 +1655,9 @@ def stop_browser():
 
 
 def restart_browser(log_callback=None):
-    stop_browser()
+    stop_browser(log_callback=log_callback)
+    if log_callback:
+        log_callback("[*] 正在启动新的浏览器实例...")
     return start_browser(log_callback=log_callback)
 
 
@@ -1563,7 +1708,7 @@ function nodeText(node) {
         node.getAttribute('aria-label'),
         node.getAttribute('title'),
         node.getAttribute('href'),
-    ].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
+    ].filter(Boolean).join(' ').replace(/\\s+/g, ' ').trim();
 }
 function scoreEntry(node) {
     const compact = nodeText(node).replace(/\s+/g, '');
@@ -1688,7 +1833,7 @@ function textOf(node) {
         node.getAttribute('name'),
         node.getAttribute('id'),
         node.getAttribute('autocomplete'),
-    ].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
+    ].filter(Boolean).join(' ').replace(/\\s+/g, ' ').trim();
 }
 function describeInput(node) {
     return [
@@ -1698,7 +1843,7 @@ function describeInput(node) {
         `placeholder=${node.getAttribute('placeholder') || ''}`,
         `aria=${node.getAttribute('aria-label') || ''}`,
         `testid=${node.getAttribute('data-testid') || ''}`,
-    ].join(' ').replace(/\s+/g, ' ').trim().slice(0, 160);
+    ].join(' ').replace(/\\s+/g, ' ').trim().slice(0, 160);
 }
 function describeAction(node) {
     return textOf(node).slice(0, 120);
@@ -1902,6 +2047,29 @@ return 'enter';
             if log_callback:
                 detail = f" ({clicked})" if isinstance(clicked, str) else ""
                 log_callback(f"[*] 已填写邮箱并提交: {email}{detail}")
+
+            error_found = False
+            for _ in range(3):
+                sleep_with_cancel(0.8, cancel_callback)
+                error_text = page.run_js("""
+                const errorNodes = Array.from(document.querySelectorAll('span, p, div')).filter(n => {
+                    const text = (n.innerText || '').toLowerCase();
+                    return text.includes('被拒绝') || text.includes('rejected') || text.includes('taken') || text.includes('已被使用') || text.includes('无效') || text.includes('invalid') || text.includes('不正确');
+                });
+                if (errorNodes.length > 0) return errorNodes[0].innerText;
+                return null;
+                """)
+                if error_text:
+                    if log_callback:
+                        log_callback(f"[!] 邮箱失效或被拒，换新... ({error_text.strip()})")
+                    email, dev_token = get_email_and_token()
+                    if log_callback and email:
+                        log_callback(f"[*] 重新尝试邮箱: {email}")
+                    error_found = True
+                    break
+            if error_found:
+                continue
+
             return email, dev_token
         sleep_with_cancel(0.5, cancel_callback)
     if last_snapshot:
@@ -2061,14 +2229,12 @@ def getTurnstileToken(log_callback=None, cancel_callback=None):
     if page is None:
         raise Exception("页面未就绪，无法执行 Turnstile")
 
-    try:
-        page.run_js(
-            "try { if (window.turnstile && typeof turnstile.reset === 'function') turnstile.reset(); } catch(e) {}"
-        )
-    except Exception:
-        pass
+    if log_callback:
+        log_callback("[*] 等待页面完成 Cloudflare 验证；如出现验证控件，请在浏览器中手动完成")
 
-    for _ in range(0, 20):
+    # Do not reset or synthesize clicks. Resetting can erase a challenge that
+    # the browser or user has already completed. Only observe the page token.
+    for _ in range(0, 60):
         raise_if_cancelled(cancel_callback)
         try:
             token = page.run_js(
@@ -2088,47 +2254,6 @@ try {
                 if log_callback:
                     log_callback(f"[*] Turnstile 已通过，token长度={len(token)}")
                 return token
-
-            challenge_input = page.ele("@name=cf-turnstile-response")
-            if challenge_input:
-                wrapper = challenge_input.parent()
-                iframe = None
-                try:
-                    iframe = wrapper.shadow_root.ele("tag:iframe")
-                except Exception:
-                    iframe = None
-                if iframe:
-                    try:
-                        iframe.run_js(
-                            """
-window.dtp = 1;
-function getRandomInt(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
-let sx = getRandomInt(800, 1200);
-let sy = getRandomInt(400, 700);
-Object.defineProperty(MouseEvent.prototype, 'screenX', { value: sx });
-Object.defineProperty(MouseEvent.prototype, 'screenY', { value: sy });
-                            """
-                        )
-                    except Exception:
-                        pass
-                    try:
-                        body_sr = iframe.ele("tag:body").shadow_root
-                        btn = body_sr.ele("tag:input")
-                        if btn:
-                            btn.click()
-                    except Exception:
-                        pass
-            else:
-                # 兜底：尝试触发页面上可见的 Turnstile 容器
-                page.run_js(
-                    """
-const nodes = Array.from(document.querySelectorAll('div,span,iframe')).filter((n) => {
-  const txt = (n.className || '') + ' ' + (n.id || '') + ' ' + (n.getAttribute?.('src') || '');
-  return String(txt).toLowerCase().includes('turnstile');
-});
-if (nodes.length && typeof nodes[0].click === 'function') nodes[0].click();
-                    """
-                )
         except Exception:
             pass
         sleep_with_cancel(1, cancel_callback)
@@ -2230,7 +2355,7 @@ const submitBtn = buttons.find((node) => {
 // 必须等待 Cloudflare 校验通过后再提交
 const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
 const cfPresent = !!cfInput
-  || !!document.querySelector('iframe[src*="turnstile"], div.cf-turnstile, [data-sitekey], script[src*="turnstile"]');
+  || !!document.querySelector('iframe[src*="turnstile"], div.cf-turnstile, [data-sitekey]');
 if (cfPresent) {
     const token = String((cfInput && cfInput.value) || '').trim();
     const solvedByToken = token.length >= 80;
@@ -2312,7 +2437,7 @@ function isVisible(node) {
 
 const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
 const cfPresent = !!cfInput
-  || !!document.querySelector('iframe[src*="turnstile"], div.cf-turnstile, [data-sitekey], script[src*="turnstile"]');
+  || !!document.querySelector('iframe[src*="turnstile"], div.cf-turnstile, [data-sitekey]');
 if (cfPresent) {
     const token = String((cfInput && cfInput.value) || '').trim();
     const solvedByToken = token.length >= 80;
@@ -2434,7 +2559,7 @@ if (!titleHit) return 'not-final-page';
 
 const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
 const cfPresent = !!cfInput
-  || !!document.querySelector('iframe[src*="turnstile"], div.cf-turnstile, [data-sitekey], script[src*="turnstile"]');
+  || !!document.querySelector('iframe[src*="turnstile"], div.cf-turnstile, [data-sitekey]');
 if (cfPresent) {
     const token = String((cfInput && cfInput.value) || '').trim();
     const solved = token.length >= 80;
@@ -2539,13 +2664,29 @@ return String(cfInput.value || '').trim().length;
         f"等待超时：未获取到 sso cookie。已看到 cookies: {sorted(last_seen_names)}"
     )
 
+def multiprocessing_worker(worker_id, count, config_data, accounts_output_file, log_queue):
+    global config
+    config.update(config_data)
 
-class GrokRegisterGUI:
+    def w_log(message):
+        timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+        log_queue.put(f"[{timestamp}] [并发-{worker_id}] {message}")
+
+    import sys
+    current_module = sys.modules[__name__]
+    setattr(current_module, 'cli_log', w_log)
+
+    run_registration_cli(count, accounts_output_file=accounts_output_file)
+
+
+class GrokRegisterGUI(ModernUIBuilder):
     def __init__(self, root):
         self.root = root
-        self.root.title("Grok 注册机")
-        self.root.geometry("1120x900")
-        self.root.minsize(960, 700)
+        load_config()
+        self.app_config = config
+        self.app_dir = _APP_DIR
+        self.outlook_pool_loader = get_pool
+        self.save_config_callback = save_config
         self.is_running = False
         self.batch_count = 0
         self.success_count = 0
@@ -2553,10 +2694,12 @@ class GrokRegisterGUI:
         self.results = []
         self.stop_requested = False
         self.ui_queue = queue.Queue()
+        self._ui_thread_id = threading.get_ident()
         self.accounts_output_file = ""
         self.setup_ui()
+        self.root.after(50, self._poll_ui_queue)
 
-    def setup_ui(self):
+    def setup_legacy_ui(self):
         load_config()
         main_frame = tk.Frame(self.root, bg=UI_BG, padx=10, pady=10)
         main_frame.pack(fill=tk.BOTH, expand=True)
@@ -2598,31 +2741,43 @@ class GrokRegisterGUI:
 
         add_label(0, 0, "邮箱服务商:")
         self.email_provider_var = tk.StringVar(value=config.get("email_provider", "duckmail"))
-        self.email_provider_combo = tk_option_menu(config_frame, self.email_provider_var, ["duckmail", "yyds", "cloudflare"], width=12)
+        self.email_provider_combo = tk_option_menu(config_frame, self.email_provider_var, ["duckmail", "yyds", "cloudflare", "gptmail", "outlook"], width=12)
         add_field(self.email_provider_combo, 0, 1, sticky=tk.W)
 
-        add_label(0, 2, "注册数量:")
+        add_label(0, 2, "注册数/并发:")
+        count_frame = tk.Frame(config_frame, bg=UI_PANEL_BG)
         self.count_var = tk.StringVar(value=str(config.get("register_count", 1)))
         self.count_spinbox = tk.Spinbox(
-            config_frame,
-            from_=1,
-            to=2500,
-            width=8,
-            textvariable=self.count_var,
-            bg=UI_ENTRY_BG,
-            fg=UI_FG,
-            insertbackground=UI_FG,
-            buttonbackground=UI_BUTTON_BG,
-            disabledbackground="#2f2f2f",
-            disabledforeground=UI_MUTED_FG,
-            relief=tk.SOLID,
+            count_frame, from_=1, to=2500, width=5, textvariable=self.count_var,
+            bg=UI_ENTRY_BG, fg=UI_FG, insertbackground=UI_FG,
+            buttonbackground=UI_BUTTON_BG, relief=tk.SOLID,
         )
-        add_field(self.count_spinbox, 0, 3, sticky=tk.W)
+        self.count_spinbox.pack(side=tk.LEFT)
+        tk.Label(count_frame, text="/", bg=UI_PANEL_BG, fg=UI_FG).pack(side=tk.LEFT, padx=2)
+        self.concurrency_var = tk.StringVar(value=str(config.get("concurrency", 1)))
+        self.concurrency_spinbox = tk.Spinbox(
+            count_frame, from_=1, to=50, width=3, textvariable=self.concurrency_var,
+            bg=UI_ENTRY_BG, fg=UI_FG, insertbackground=UI_FG,
+            buttonbackground=UI_BUTTON_BG, relief=tk.SOLID,
+        )
+        self.concurrency_spinbox.pack(side=tk.LEFT)
+        add_field(count_frame, 0, 3, sticky=tk.W)
 
         add_label(1, 0, "注册选项:")
+        options_frame = tk.Frame(config_frame, bg=UI_PANEL_BG)
         self.nsfw_var = tk.BooleanVar(value=config.get("enable_nsfw", True))
-        self.nsfw_check = tk_checkbutton(config_frame, text="注册后开启 NSFW", variable=self.nsfw_var)
-        add_field(self.nsfw_check, 1, 1, sticky=tk.W)
+        self.nsfw_check = tk_checkbutton(options_frame, text="开启 NSFW", variable=self.nsfw_var)
+        self.nsfw_check.pack(side=tk.LEFT, padx=(0, 5))
+
+        self.minimized_var = tk.BooleanVar(value=config.get("browser_minimized", False))
+        self.minimized_check = tk_checkbutton(options_frame, text="最小化", variable=self.minimized_var)
+        self.minimized_check.pack(side=tk.LEFT, padx=(0, 5))
+
+        self.headless_var = tk.BooleanVar(value=config.get("browser_headless", False))
+        self.headless_check = tk_checkbutton(options_frame, text="无头", variable=self.headless_var)
+        self.headless_check.pack(side=tk.LEFT)
+
+        add_field(options_frame, 1, 1, sticky=tk.W)
 
         add_label(1, 2, "代理（可选）:")
         self.proxy_var = tk.StringVar(value=config.get("proxy", ""))
@@ -2697,6 +2852,18 @@ class GrokRegisterGUI:
         self.grok2api_remote_key_entry = tk_entry(config_frame, textvariable=self.grok2api_remote_key_var, width=72)
         add_field(self.grok2api_remote_key_entry, 9, 1, columnspan=3)
 
+        add_label(10, 0, "GPTMail API Key:")
+        self.gptmail_api_key_var = tk.StringVar(value=str(config.get("gptmail_api_key", "")))
+        self.gptmail_api_key_entry = tk_entry(config_frame, textvariable=self.gptmail_api_key_var, width=72)
+        add_field(self.gptmail_api_key_entry, 10, 1, columnspan=3)
+
+        add_label(11, 0, "Outlook 凭证文件:")
+        self.outlook_credentials_file_var = tk.StringVar(value=str(config.get("outlook_credentials_file", "")))
+        self.outlook_credentials_file_entry = tk_entry(
+            config_frame, textvariable=self.outlook_credentials_file_var, width=72
+        )
+        add_field(self.outlook_credentials_file_entry, 11, 1, columnspan=3)
+
         btn_frame = tk.Frame(main_frame, bg=UI_BG)
         btn_frame.grid(row=1, column=0, sticky=tk.EW, pady=(0, 6))
         self.start_btn = tk_button(btn_frame, text="开始注册", command=self.start_registration)
@@ -2749,21 +2916,64 @@ class GrokRegisterGUI:
         timestamp = datetime.datetime.now().strftime("%H:%M:%S")
         line = f"[{timestamp}] {message}"
         print(line, flush=True)
+        if threading.get_ident() != self._ui_thread_id:
+            self.ui_queue.put(("log", line))
+            return
+        self._append_log_line(line)
+
+    def _append_log_line(self, line):
         self.log_text.insert(tk.END, f"{line}\n")
         self.log_text.see(tk.END)
+
+    def _poll_ui_queue(self):
+        try:
+            while True:
+                event = self.ui_queue.get_nowait()
+                kind = event[0]
+                if kind == "log":
+                    self._append_log_line(event[1])
+                elif kind == "stats":
+                    self._apply_stats(event[1], event[2])
+                elif kind == "running":
+                    self._apply_running_ui(event[1])
+        except queue.Empty:
+            pass
+        try:
+            self.root.after(50, self._poll_ui_queue)
+        except Exception:
+            pass
 
     def clear_log(self):
         self.log_text.delete(1.0, tk.END)
 
     def update_stats(self):
-        self.stats_var.set(f"成功: {self.success_count} | 失败: {self.fail_count}")
+        if threading.get_ident() != self._ui_thread_id:
+            self.ui_queue.put(("stats", self.success_count, self.fail_count))
+            return
+        self._apply_stats(self.success_count, self.fail_count)
+
+    def _apply_stats(self, success_count, fail_count):
+        self.stats_var.set(f"成功: {success_count} | 失败: {fail_count}")
+        if hasattr(self, "success_metric_var"):
+            self.success_metric_var.set(str(success_count))
+        if hasattr(self, "fail_metric_var"):
+            self.fail_metric_var.set(str(fail_count))
 
     def _set_running_ui(self, running):
+        if threading.get_ident() != self._ui_thread_id:
+            self.ui_queue.put(("running", bool(running)))
+            return
+        self._apply_running_ui(running)
+
+    def _apply_running_ui(self, running):
         self.is_running = running
-        self.start_btn.config(state=tk.DISABLED if running else tk.NORMAL)
-        self.stop_btn.config(state=tk.NORMAL if running else tk.DISABLED)
         self.status_var.set("运行中..." if running else "就绪")
-        self.status_label.config(foreground="blue" if running else "green")
+        if hasattr(self, "sync_running_controls"):
+            self.sync_running_controls(running)
+        else:
+            self.start_btn.config(state=tk.DISABLED if running else tk.NORMAL)
+            self.stop_btn.config(state=tk.NORMAL if running else tk.DISABLED)
+            self.status_label.config(foreground="blue" if running else "green")
 
     def should_stop(self):
         return self.stop_requested or not self.is_running
@@ -2773,10 +2983,16 @@ class GrokRegisterGUI:
             self.log("[!] 当前已有任务在运行")
             return
 
+        if hasattr(self, "collect_ui_config"):
+            self.collect_ui_config()
         config["email_provider"] = self.email_provider_var.get().strip() or "duckmail"
         config["enable_nsfw"] = bool(self.nsfw_var.get())
+        config["browser_minimized"] = bool(self.minimized_var.get())
+        config["browser_headless"] = bool(self.headless_var.get())
         config["proxy"] = self.proxy_var.get().strip()
         config["duckmail_api_key"] = self.api_key_var.get().strip()
+        config["gptmail_api_key"] = getattr(self, "gptmail_api_key_var").get().strip()
+        config["outlook_credentials_file"] = self.outlook_credentials_file_var.get().strip()
         config["cloudflare_api_base"] = self.cloudflare_api_base_var.get().strip()
         config["cloudflare_api_key"] = self.cloudflare_api_key_var.get().strip()
         config["cloudflare_auth_mode"] = self.cloudflare_auth_mode_var.get().strip() or "none"
@@ -2796,6 +3012,22 @@ class GrokRegisterGUI:
         if config["email_provider"] == "cloudflare" and not config["cloudflare_api_base"]:
             self.log("[!] Cloudflare 模式需要先填写 Cloudflare API Base")
             return
+        if config["email_provider"] == "outlook":
+            credentials_file = config["outlook_credentials_file"]
+            if not credentials_file:
+                self.log("[!] Outlook 模式需要先填写凭证文件路径")
+                return
+            resolved_file = credentials_file if os.path.isabs(credentials_file) else os.path.join(_APP_DIR, credentials_file)
+            try:
+                pool = get_pool(resolved_file)
+                usable = sum(1 for account in pool.accounts if account.usable)
+                self.log(f"[*] Outlook 已导入 {len(pool.accounts)} 个账号，可用 {usable} 个")
+                if usable < 1:
+                    self.log("[!] Outlook 凭证中没有带 client_id 和 refresh_token 的可用账号")
+                    return
+            except Exception as exc:
+                self.log(f"[!] Outlook 凭证文件读取失败: {exc}")
+                return
         try:
             count = int(self.count_var.get())
         except Exception:
@@ -2809,21 +3041,93 @@ class GrokRegisterGUI:
         self.results = []
         now = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         self.accounts_output_file = os.path.join(
-            os.path.dirname(__file__), f"accounts_{now}.txt"
+            _APP_DIR, f"accounts_{now}.txt"
         )
         self.update_stats()
         self._set_running_ui(True)
-        self.log(f"[*] 配置已保存，开始执行。目标数量: {count}")
-        self.log(f"[*] 成功账号将实时保存到: {self.accounts_output_file}")
-        threading.Thread(
-            target=self.run_registration,
-            args=(count,),
-            daemon=True,
-        ).start()
+
+        try:
+            concurrency = int(self.concurrency_var.get())
+        except Exception:
+            concurrency = 1
+        if config["email_provider"] == "outlook" and concurrency > 1:
+            concurrency = 1
+            self.log("[*] Outlook 账号池为避免重复占用，已自动限制为单并发")
+
+        if concurrency <= 1:
+            self.log(f"[*] 配置已保存，开始执行单进程。目标数量: {count}")
+            self.log(f"[*] 成功账号将实时保存到: {self.accounts_output_file}")
+            threading.Thread(
+                target=self.run_registration,
+                args=(count,),
+                daemon=True,
+            ).start()
+        else:
+            self.log(f"[*] 配置已保存，启动并发模式。进程数: {concurrency}，总目标: {count}")
+            self.log(f"[*] 成功账号将实时保存到: {self.accounts_output_file}")
+            threading.Thread(
+                target=self.run_registration_concurrently,
+                args=(count, concurrency),
+                daemon=True,
+            ).start()
+
+    def run_registration_concurrently(self, total_count, concurrency):
+        import multiprocessing
+
+        self.log_queue = multiprocessing.Queue()
+        self.root.after(100, self._poll_log_queue)
+
+        base = total_count // concurrency
+        rem = total_count % concurrency
+        self.workers = []
+
+        for i in range(concurrency):
+            c = base + (1 if i < rem else 0)
+            if c > 0:
+                p = multiprocessing.Process(
+                    target=multiprocessing_worker,
+                    args=(i+1, c, config, self.accounts_output_file, self.log_queue)
+                )
+                p.start()
+                self.workers.append(p)
+
+        for p in self.workers:
+            p.join()
+
+        self.log_queue.put("ALL_DONE")
+        self.log("[*] 所有并发任务结束")
+        self.root.after(0, lambda: self._set_running_ui(False))
+
+    def _poll_log_queue(self):
+        if not hasattr(self, 'log_queue'):
+            return
+        try:
+            while True:
+                msg = self.log_queue.get_nowait()
+                if msg == "ALL_DONE":
+                    break
+                print(msg, flush=True)
+                self.log_text.insert(tk.END, f"{msg}\n")
+                self.log_text.see(tk.END)
+                if "[+] 注册成功" in msg:
+                    self.success_count += 1
+                    self.update_stats()
+                if "[-] 注册失败" in msg or "达到最大重试次数" in msg:
+                    self.fail_count += 1
+                    self.update_stats()
+        except queue.Empty:
+            pass
+        if self.is_running:
+            self.root.after(100, self._poll_log_queue)
 
     def stop_registration(self):
         self.stop_requested = True
         self.log("[!] 用户停止注册")
+        if hasattr(self, 'workers'):
+            for p in self.workers:
+                if p.is_alive():
+                    p.terminate()
+            self.log("[*] 已强行终止并发子进程")
 
     def run_registration(self, count):
         try:
@@ -2852,14 +3156,16 @@ class GrokRegisterGUI:
                             log_callback=self.log, cancel_callback=self.should_stop
                         )
                         self.log(f"[*] 邮箱: {email}")
-                        self.log(f"[Debug] 邮箱credential(jwt): {dev_token}")
+                        if get_email_provider() != "outlook":
+                            self.log(f"[Debug] 邮箱credential(jwt): {dev_token}")
                         try:
                             with open(
-                                os.path.join(os.path.dirname(__file__), "mail_credentials.txt"),
+                                os.path.join(_APP_DIR, "mail_credentials.txt"),
                                 "a",
                                 encoding="utf-8",
                             ) as f:
-                                f.write(f"{email}\t{dev_token}\n")
+                                if get_email_provider() != "outlook":
+                                    f.write(f"{email}\t{dev_token}\n")
                         except Exception:
                             pass
                         self.log("[*] 3. 拉取验证码")
@@ -2970,6 +3276,7 @@ class GrokRegisterGUI:
                     i += 1
                     self.log(f"[-] 注册失败: {exc}")
                 finally:
+                    release_outlook_lease("failed", "registration attempt ended before mailbox verification")
                     self.update_stats()
                     if self.should_stop():
                         break
@@ -3002,16 +3309,17 @@ def cli_log(message):
     print(f"[{timestamp}] {message}", flush=True)
 
 
-def run_registration_cli(count):
+def run_registration_cli(count, accounts_output_file=None):
     controller = CliStopController()
     success_count = 0
     fail_count = 0
     retry_count_for_slot = 0
     max_slot_retry = 3
-    accounts_output_file = os.path.join(
-        os.path.dirname(__file__),
-        f"accounts_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
-    )
+    if not accounts_output_file:
+        accounts_output_file = os.path.join(
+            _APP_DIR,
+            f"accounts_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+        )
     cli_log(f"[*] 终端模式启动，目标数量: {count}")
     cli_log(f"[*] 成功账号将实时保存到: {accounts_output_file}")
     try:
@@ -3041,7 +3349,7 @@ def run_registration_cli(count):
                     cli_log(f"[Debug] 邮箱credential(jwt): {dev_token}")
                     try:
                         with open(
-                            os.path.join(os.path.dirname(__file__), "mail_credentials.txt"),
+                            os.path.join(_APP_DIR, "mail_credentials.txt"),
                             "a",
                             encoding="utf-8",
                         ) as f:
@@ -3150,6 +3458,7 @@ def run_registration_cli(count):
                 i += 1
                 cli_log(f"[-] 注册失败: {exc}")
             finally:
+                release_outlook_lease("failed", "registration attempt ended before mailbox verification")
                 if controller.should_stop():
                     break
                 if browser is None:
@@ -3185,11 +3494,12 @@ def main_cli():
 
 
 def main():
+    import multiprocessing
+    multiprocessing.freeze_support()
     if len(sys.argv) > 1 and sys.argv[1].strip().lower() in ("start", "cli", "--cli"):
         main_cli()
         return
-    root = tk.Tk()
-    setup_light_theme(root)
+    root = create_root()
     app = GrokRegisterGUI(root)
     root.mainloop()
 
