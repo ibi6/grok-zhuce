@@ -101,6 +101,7 @@ class ModernUIBuilder:
         self.grok2api_remote_key_var = tk.StringVar(value=str(cfg.get("grok2api_remote_app_key", "")))
         self.cpa_export_enabled_var = tk.BooleanVar(value=bool(cfg.get("cpa_export_enabled", True)))
         self.cpa_auth_dir_var = tk.StringVar(value=str(cfg.get("cpa_auth_dir", "cpa_auths")))
+        self.cpa_proxy_var = tk.StringVar(value=str(cfg.get("cpa_proxy", "")))
         self.cpa_probe_after_write_var = tk.BooleanVar(value=bool(cfg.get("cpa_probe_after_write", True)))
         self.cpa_hotload_dir_var = tk.StringVar(value=str(cfg.get("cpa_hotload_dir", "")))
         self.cpa_copy_to_hotload_var = tk.BooleanVar(value=bool(cfg.get("cpa_copy_to_hotload", False)))
@@ -407,6 +408,13 @@ class ModernUIBuilder:
         self.cpa_export_enabled_check.pack(anchor="w")
         f, self.cpa_auth_dir_entry = self._field(cbody, "CPA 认证目录", self.cpa_auth_dir_var)
         f.pack(fill="x", pady=(14, 0))
+        f, self.cpa_proxy_entry = self._field(
+            cbody,
+            "CPA / 账号初始化代理",
+            self.cpa_proxy_var,
+            placeholder="http://127.0.0.1:7897",
+        )
+        f.pack(fill="x", pady=(14, 0))
         self.cpa_probe_after_write_check = self._switch(cbody, "写入后检测账号可用性", self.cpa_probe_after_write_var)
         self.cpa_probe_after_write_check.pack(anchor="w", pady=(14, 0))
         f, self.cpa_hotload_dir_entry = self._field(cbody, "热加载目录（可选）", self.cpa_hotload_dir_var)
@@ -516,6 +524,7 @@ class ModernUIBuilder:
         cfg["grok2api_remote_app_key"] = self.grok2api_remote_key_var.get().strip()
         cfg["cpa_export_enabled"] = bool(self.cpa_export_enabled_var.get())
         cfg["cpa_auth_dir"] = self.cpa_auth_dir_var.get().strip() or "cpa_auths"
+        cfg["cpa_proxy"] = self.cpa_proxy_var.get().strip()
         cfg["cpa_probe_after_write"] = bool(self.cpa_probe_after_write_var.get())
         cfg["cpa_hotload_dir"] = self.cpa_hotload_dir_var.get().strip()
         cfg["cpa_copy_to_hotload"] = bool(self.cpa_copy_to_hotload_var.get())

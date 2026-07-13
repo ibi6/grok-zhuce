@@ -1395,6 +1395,12 @@ def set_birth_date(session, log_callback=None):
             )
         if 200 <= res.status_code < 300:
             return True, "ok"
+        body_text = str(res.text or "").lower()
+        if res.status_code == 429 and (
+            "birth-date-change-limit-reached" in body_text
+            or "birth date is locked once set" in body_text
+        ):
+            return True, "birth date already set"
         if is_cloudflare_block_response(res):
             return (
                 False,
@@ -1478,11 +1484,28 @@ def update_nsfw_settings(session, log_callback=None):
         return False, f"update_nsfw_settings 异常: {e}"
 
 
-def enable_nsfw_for_token(token, cf_clearance="", log_callback=None):
-    proxies = get_proxies()
+def initialize_account_for_api(
+    token,
+    cf_clearance="",
+    enable_nsfw=False,
+    retries=3,
+    log_callback=None,
+    cancel_callback=None,
+):
+    initialization_proxy = str(
+        config.get("cpa_proxy") or config.get("proxy") or ""
+    ).strip()
+    proxies = (
+        {"http": initialization_proxy, "https": initialization_proxy}
+        if initialization_proxy
+        else {}
+    )
     user_agent = get_user_agent()
     try:
         with requests.Session(impersonate="chrome120", proxies=proxies) as session:
+            if log_callback:
+                proxy_label = initialization_proxy or "直连"
+                log_callback(f"[*] 账号初始化网络: {proxy_label}")
             cookie_parts = [f"sso={token}", f"sso-rw={token}"]
             if cf_clearance:
                 cookie_parts.append(f"cf_clearance={cf_clearance}")
@@ -1492,18 +1515,48 @@ def enable_nsfw_for_token(token, cf_clearance="", log_callback=None):
                     "cookie": "; ".join(cookie_parts),
                 }
             )
-            ok, message = set_tos_accepted(session, log_callback)
-            if not ok:
-                return False, message
-            ok, message = set_birth_date(session, log_callback)
-            if not ok:
-                return False, message
-            ok, message = update_nsfw_settings(session, log_callback)
-            if not ok:
-                return False, message
-            return True, "成功开启 NSFW"
+
+            steps = [
+                ("接受服务条款", set_tos_accepted),
+                ("设置生日", set_birth_date),
+            ]
+            if enable_nsfw:
+                steps.append(("开启 NSFW", update_nsfw_settings))
+
+            for label, action in steps:
+                last_message = ""
+                for attempt in range(1, max(int(retries), 1) + 1):
+                    raise_if_cancelled(cancel_callback)
+                    ok, last_message = action(session, log_callback)
+                    if ok:
+                        if log_callback:
+                            log_callback(f"[*] 账号初始化步骤成功: {label}")
+                        break
+                    if log_callback:
+                        log_callback(
+                            f"[!] 账号初始化步骤失败: {label} "
+                            f"({attempt}/{retries}) {last_message}"
+                        )
+                    if attempt < retries:
+                        sleep_with_cancel(min(attempt * 2, 6), cancel_callback)
+                else:
+                    return False, f"{label}失败: {last_message}"
+
+            message = "账号 API 权限初始化完成"
+            if enable_nsfw:
+                message += "，NSFW 已开启"
+            return True, message
     except Exception as e:
-        return False, f"异常: {str(e)}"
+        return False, f"账号初始化异常: {str(e)}"
+
+
+def enable_nsfw_for_token(token, cf_clearance="", log_callback=None):
+    return initialize_account_for_api(
+        token,
+        cf_clearance=cf_clearance,
+        enable_nsfw=True,
+        log_callback=log_callback,
+    )
 
 
 SIGNUP_URL = "https://accounts.x.ai/sign-up?redirect=grok-com"
@@ -3199,11 +3252,23 @@ class GrokRegisterGUI(ModernUIBuilder):
                     sso = wait_for_sso_cookie(
                         log_callback=self.log, cancel_callback=self.should_stop
                     )
+                    self.log("[*] 6. 初始化账号 API 权限")
+                    init_ok, init_msg = initialize_account_for_api(
+                        sso,
+                        enable_nsfw=bool(config.get("enable_nsfw", True)),
+                        log_callback=self.log,
+                        cancel_callback=self.should_stop,
+                    )
+                    if init_ok:
+                        self.log(f"[+] {init_msg}")
+                        sleep_with_cancel(2, self.should_stop)
+                    else:
+                        self.log(f"[!] 账号初始化失败，将跳过 CPA 导出: {init_msg}")
                     cpa_thread = None
                     cpa_result_box = {}
                     _cpa_page = page if page is not None else None
-                    if config.get("cpa_export_enabled", True):
-                        self.log("[*] 6. CPA xAI 导出 (OIDC refreshToken) — 复用注册浏览器")
+                    if config.get("cpa_export_enabled", True) and init_ok:
+                        self.log("[*] 7. CPA xAI 导出并验证 chat 权限")
                         def _cpa_mint():
                             try:
                                 cpa_result_box["result"] = export_cpa_xai_for_account(
@@ -3213,15 +3278,6 @@ class GrokRegisterGUI(ModernUIBuilder):
                                 cpa_result_box["result"] = {"ok": False, "error": str(e)}
                         cpa_thread = threading.Thread(target=_cpa_mint, daemon=True)
                         cpa_thread.start()
-                    if config.get("enable_nsfw", True):
-                        self.log("[*] 6. 开启 NSFW")
-                        nsfw_ok, nsfw_msg = enable_nsfw_for_token(
-                            sso, log_callback=self.log
-                        )
-                        if nsfw_ok:
-                            self.log(f"[+] NSFW 开启成功: {nsfw_msg}")
-                        else:
-                            self.log(f"[!] NSFW 未开启，继续保存账号: {nsfw_msg}")
                     if cpa_thread is not None:
                         self.log("[*] 等待 CPA xAI 导出完成...")
                         cpa_thread.join(timeout=float(config.get("cpa_mint_timeout_sec", 240) or 240))
@@ -3232,6 +3288,8 @@ class GrokRegisterGUI(ModernUIBuilder):
                             self.log(f"[cpa] CPA 导出已跳过")
                         else:
                             self.log(f"[!] CPA xAI 导出失败: {cpa_result.get('error', '未知错误')}")
+                    elif config.get("cpa_export_enabled", True) and not init_ok:
+                        self.log("[!] CPA xAI 导出已跳过，避免写入无 chat 权限的凭证")
                     self.results.append({"email": email, "sso": sso, "profile": profile})
                     try:
                         line = f"{email}----{profile.get('password','')}----{sso}\n"
@@ -3387,11 +3445,23 @@ def run_registration_cli(count, accounts_output_file=None):
                 sso = wait_for_sso_cookie(
                     log_callback=cli_log, cancel_callback=controller.should_stop
                 )
+                cli_log("[*] 6. 初始化账号 API 权限")
+                init_ok, init_msg = initialize_account_for_api(
+                    sso,
+                    enable_nsfw=bool(config.get("enable_nsfw", True)),
+                    log_callback=cli_log,
+                    cancel_callback=controller.should_stop,
+                )
+                if init_ok:
+                    cli_log(f"[+] {init_msg}")
+                    sleep_with_cancel(2, controller.should_stop)
+                else:
+                    cli_log(f"[!] 账号初始化失败，将跳过 CPA 导出: {init_msg}")
                 cpa_thread = None
                 cpa_result_box = {}
                 _cpa_page = page if page is not None else None
-                if config.get("cpa_export_enabled", True):
-                    cli_log("[*] 6. CPA xAI 导出 (OIDC refreshToken) — 复用注册浏览器")
+                if config.get("cpa_export_enabled", True) and init_ok:
+                    cli_log("[*] 7. CPA xAI 导出并验证 chat 权限")
                     def _cpa_mint_cli():
                         try:
                             cpa_result_box["result"] = export_cpa_xai_for_account(
@@ -3401,15 +3471,6 @@ def run_registration_cli(count, accounts_output_file=None):
                             cpa_result_box["result"] = {"ok": False, "error": str(e)}
                     cpa_thread = threading.Thread(target=_cpa_mint_cli, daemon=True)
                     cpa_thread.start()
-                if config.get("enable_nsfw", True):
-                    cli_log("[*] 6. 开启 NSFW")
-                    nsfw_ok, nsfw_msg = enable_nsfw_for_token(
-                        sso, log_callback=cli_log
-                    )
-                    if nsfw_ok:
-                        cli_log(f"[+] NSFW 开启成功: {nsfw_msg}")
-                    else:
-                        cli_log(f"[!] NSFW 未开启，继续保存账号: {nsfw_msg}")
                 if cpa_thread is not None:
                     cli_log("[*] 等待 CPA xAI 导出完成...")
                     cpa_thread.join(timeout=float(config.get("cpa_mint_timeout_sec", 240) or 240))
@@ -3420,6 +3481,8 @@ def run_registration_cli(count, accounts_output_file=None):
                         cli_log("[cpa] CPA 导出已跳过")
                     else:
                         cli_log(f"[!] CPA xAI 导出失败: {cpa_result.get('error', '未知错误')}")
+                elif config.get("cpa_export_enabled", True) and not init_ok:
+                    cli_log("[!] CPA xAI 导出已跳过，避免写入无 chat 权限的凭证")
                 try:
                     line = f"{email}----{profile.get('password','')}----{sso}\n"
                     with open(accounts_output_file, "a", encoding="utf-8") as f:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import Any, Callable
 
@@ -28,7 +29,7 @@ def mint_and_export(
     headless: bool = False,
     base_url: str = DEFAULT_BASE_URL,
     probe: bool = True,
-    probe_chat: bool = False,
+    probe_chat: bool = True,
     browser_timeout_sec: float = 240.0,
     force_standalone: bool = False,
     cookies: Any | None = None,
@@ -98,12 +99,28 @@ def mint_and_export(
             result["ok"] = False
             result["error"] = "token ok but grok-4.5 not listed"
         if probe_chat and pr.get("has_grok_45"):
-            ch = probe_mini_response(
-                tokens["access_token"], base_url=base_url, proxy=resolved or None
-            )
+            ch = None
+            for attempt in range(1, 4):
+                ch = probe_mini_response(
+                    tokens["access_token"], base_url=base_url, proxy=resolved or None
+                )
+                if ch.get("ok"):
+                    break
+                error_text = str(ch.get("error") or "").lower()
+                if "permission-denied" not in error_text or attempt >= 3:
+                    break
+                wait_seconds = attempt * 5
+                log(f"chat permission not ready; retry in {wait_seconds}s")
+                time.sleep(wait_seconds)
+            ch = ch or {"ok": False, "status": 0, "error": "chat probe missing result"}
             result["probe_chat"] = ch
             log(f"probe chat: ok={ch.get('ok')} model={ch.get('model')} text={ch.get('text')!r}")
             if not ch.get("ok"):
                 result["ok"] = False
                 result["error"] = f"chat probe failed: {ch.get('error') or ch.get('status')}"
+        if not result.get("ok"):
+            payload["disabled"] = True
+            payload["probe_error"] = result.get("error", "CPA validation failed")
+            write_cpa_xai_auth(auth_dir, payload, filename=path.name)
+            log(f"disabled unusable credential: {path}")
     return result

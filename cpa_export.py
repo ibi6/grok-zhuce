@@ -119,7 +119,9 @@ def export_cpa_xai_for_account(
     # Default headed: headless is frequently Cloudflare-blocked on accounts.x.ai
     headless = bool(cfg.get("cpa_headless", False))
     probe = bool(cfg.get("cpa_probe_after_write", True))
-    probe_chat = bool(cfg.get("cpa_probe_chat", False))
+    # A models-only probe accepts accounts that can list grok-4.5 but are
+    # denied by the chat endpoint. Always verify one minimal chat response.
+    probe_chat = bool(probe)
     timeout = float(cfg.get("cpa_mint_timeout_sec", 240))
     base_url = cfg.get("cpa_base_url") or "https://cli-chat-proxy.grok.com/v1"
     force_standalone = bool(cfg.get("cpa_force_standalone", False))
