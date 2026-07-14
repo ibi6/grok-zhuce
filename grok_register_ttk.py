@@ -83,6 +83,7 @@ DEFAULT_CONFIG = {
     "register_count": 1,
     "concurrency": 1,
     "browser_headless": False,
+    "headless_auto_fallback": True,
     "browser_minimized": False,
     "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
     "grok2api_auto_add_local": True,
@@ -126,6 +127,12 @@ class RegistrationCancelled(Exception):
 
 
 class AccountRetryNeeded(Exception):
+    pass
+
+
+class HeadlessBrowserBlocked(Exception):
+    """Raised when headless Chromium receives a Cloudflare interstitial."""
+
     pass
 
 
@@ -1881,8 +1888,49 @@ def refresh_active_page():
     return page
 
 
+def page_has_cloudflare_interstitial(page_obj=None) -> bool:
+    target = page_obj or page
+    if target is None:
+        return False
+    try:
+        url = str(getattr(target, "url", "") or "").lower()
+    except Exception:
+        url = ""
+    try:
+        title = str(getattr(target, "title", "") or "").lower()
+    except Exception:
+        title = ""
+    try:
+        html = str(getattr(target, "html", "") or "")[:12000].lower()
+    except Exception:
+        html = ""
+    haystack = "\n".join((url, title, html))
+    markers = (
+        "cloudflare",
+        "just a moment",
+        "cf-chl-",
+        "challenge-platform",
+        "verify you are human",
+        "checking your browser",
+        "enable javascript and cookies",
+    )
+    return any(marker in haystack for marker in markers)
+
+
+def fallback_from_headless(log_callback=None, cancel_callback=None):
+    """Restart in minimized headed mode after a headless CF interstitial."""
+    raise_if_cancelled(cancel_callback)
+    config["browser_headless"] = False
+    config["browser_minimized"] = True
+    if log_callback:
+        log_callback("[!] 无头模式遇到 Cloudflare 中间页，自动切换为最小化窗口模式重试")
+    restart_browser(log_callback=log_callback)
+    raise_if_cancelled(cancel_callback)
+
+
 def click_email_signup_button(timeout=10, log_callback=None, cancel_callback=None):
     global page
+    started_at = time.time()
     deadline = time.time() + timeout
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
@@ -1940,7 +1988,21 @@ return candidates[0].text || true;
             current_url = page.url if page else "none"
             log_callback(f"[Debug] 当前URL: {current_url}")
 
+        if (
+            config.get("browser_headless", False)
+            and time.time() - started_at >= 2
+            and page_has_cloudflare_interstitial(page)
+        ):
+            if log_callback:
+                log_callback("[Debug] 无头页面被 Cloudflare 挑战拦截")
+            raise HeadlessBrowserBlocked("Cloudflare interstitial page")
+
         sleep_with_cancel(1, cancel_callback)
+
+    if page_has_cloudflare_interstitial(page):
+        if log_callback:
+            log_callback("[Debug] 检测到 Cloudflare/挑战中间页，当前页面没有注册按钮")
+        raise HeadlessBrowserBlocked("Cloudflare interstitial page")
 
     if log_callback:
         page_html = page.html[:500] if page else "no page"
@@ -1973,9 +2035,22 @@ def open_signup_page(log_callback=None, cancel_callback=None):
     sleep_with_cancel(2, cancel_callback)
     if log_callback:
         log_callback(f"[*] 当前URL: {page.url}")
-    click_email_signup_button(
-        log_callback=log_callback, cancel_callback=cancel_callback
-    )
+    try:
+        click_email_signup_button(
+            log_callback=log_callback, cancel_callback=cancel_callback
+        )
+    except HeadlessBrowserBlocked:
+        if config.get("browser_headless", False) and config.get("headless_auto_fallback", True):
+            fallback_from_headless(log_callback=log_callback, cancel_callback=cancel_callback)
+            page = browser.get_tab(0)
+            page.get(SIGNUP_URL)
+            page.wait.doc_loaded()
+            sleep_with_cancel(2, cancel_callback)
+            click_email_signup_button(
+                log_callback=log_callback, cancel_callback=cancel_callback
+            )
+        else:
+            raise
 
 
 def has_profile_form(log_callback=None):

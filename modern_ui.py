@@ -335,7 +335,7 @@ class ModernUIBuilder:
         self.nsfw_check.pack(side="left", padx=14, pady=14)
         self.minimized_check = self._switch(switches, "最小化浏览器", self.minimized_var)
         self.minimized_check.pack(side="left", padx=14, pady=14)
-        self.headless_check = self._switch(switches, "无头模式", self.headless_var)
+        self.headless_check = self._switch(switches, "无头模式（受拦截时自动最小化）", self.headless_var)
         self.headless_check.pack(side="left", padx=14, pady=14)
         ctk.CTkLabel(body, text="Outlook 邮箱模式会自动限制为单并发，避免同一邮箱重复占用。", text_color=COLORS["warning"], fg_color=COLORS["warning_soft"], corner_radius=8, font=(FONT, 10)).grid(row=4, column=0, columnspan=2, sticky="ew", pady=(14, 0), ipady=8)
         actions = ctk.CTkFrame(page, fg_color="transparent")
@@ -675,7 +675,7 @@ class ModernUIBuilder:
         if not hasattr(self, "browser_mode_var"):
             return
         if self.headless_var.get():
-            mode = "无头模式"
+            mode = "无头模式（CF 时自动最小化）"
         elif self.minimized_var.get():
             mode = "最小化窗口"
         else:

@@ -25,6 +25,39 @@ class StabilityIntegrationTests(unittest.TestCase):
             any("proxy-server=http://127.0.0.1:7897" in arg for arg in options.arguments)
         )
 
+    def test_cloudflare_interstitial_is_detected(self):
+        page = type(
+            "Page",
+            (),
+            {
+                "url": "https://accounts.x.ai/sign-up",
+                "title": "Cloudflare",
+                "html": "<title>Just a moment...</title><div id='cf-chl-widget'></div>",
+            },
+        )()
+        self.assertTrue(app.page_has_cloudflare_interstitial(page))
+
+    def test_normal_signup_page_is_not_treated_as_interstitial(self):
+        page = type(
+            "Page",
+            (),
+            {
+                "url": "https://accounts.x.ai/sign-up",
+                "title": "Create your account",
+                "html": "<button>Continue with email</button>",
+            },
+        )()
+        self.assertFalse(app.page_has_cloudflare_interstitial(page))
+
+    def test_headless_fallback_switches_to_minimized_mode(self):
+        app.config["browser_headless"] = True
+        app.config["browser_minimized"] = False
+        with patch("grok_register_ttk.restart_browser") as restart:
+            app.fallback_from_headless()
+        self.assertFalse(app.config["browser_headless"])
+        self.assertTrue(app.config["browser_minimized"])
+        restart.assert_called_once()
+
     def test_http_proxy_failure_does_not_retry_direct(self):
         app.config["proxy"] = "http://127.0.0.1:7897"
         with patch("grok_register_ttk.requests.get") as request:

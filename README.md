@@ -101,6 +101,7 @@ cp config.example.json config.json
 | `proxy_check_url` | 代理健康检测地址，默认 `https://accounts.x.ai/` |
 | `proxy_failure_threshold` | 连续代理连接失败多少次后进入冷却 |
 | `proxy_cooldown_seconds` | 代理故障冷却秒数 |
+| `headless_auto_fallback` | 无头模式遇到 Cloudflare 中间页时，自动切换为最小化窗口模式 |
 | `enable_nsfw` | 注册后是否尝试开启 NSFW |
 | `cloudflare_api_base` | Cloudflare 临时邮箱 API 地址 |
 | `cloudflare_api_key` | Cloudflare 临时邮箱接口密钥；默认匿名模式留空，admin 模式填 `ADMIN_PASSWORD` |
@@ -267,6 +268,10 @@ GUI 数量控件可能有上限。CLI 模式直接读取 `config.json` 中的 `r
 ### Clash 或 V2Ray 怎么接入代理池？
 
 在代理池页面填写客户端提供的本地 HTTP/SOCKS5 监听地址，例如 `http://127.0.0.1:7897`。程序不下载或解析订阅链接，也不会按账号主动轮换出口；只有明确的代理连接故障才会为下一次完整尝试切换代理。
+
+### 为什么无头模式会自动变成最小化窗口？
+
+部分 Cloudflare 页面会直接拦截无头 Chromium，页面中不会出现邮箱注册按钮。默认 `headless_auto_fallback=true`，检测到这种中间页后会自动改用最小化的真实窗口继续。若必须严格保持无头，可在配置中关闭该开关，但注册成功率可能明显下降。
 
 ## 目录结构
 
