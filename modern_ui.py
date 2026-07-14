@@ -85,6 +85,7 @@ class ModernUIBuilder:
         self.nsfw_var = tk.BooleanVar(value=cfg.get("enable_nsfw", True))
         self.minimized_var = tk.BooleanVar(value=cfg.get("browser_minimized", False))
         self.headless_var = tk.BooleanVar(value=cfg.get("browser_headless", False))
+        self.turnstile_auto_skip_var = tk.BooleanVar(value=cfg.get("turnstile_auto_skip", True))
         self.proxy_var = tk.StringVar(value=cfg.get("proxy", ""))
         try:
             self.proxy_pool_items = normalize_proxy_entries(cfg.get("proxy_pool") or [])
@@ -337,7 +338,13 @@ class ModernUIBuilder:
         self.minimized_check.pack(side="left", padx=14, pady=14)
         self.headless_check = self._switch(switches, "无头模式（受拦截时自动最小化）", self.headless_var)
         self.headless_check.pack(side="left", padx=14, pady=14)
-        ctk.CTkLabel(body, text="Outlook 邮箱模式会自动限制为单并发，避免同一邮箱重复占用。", text_color=COLORS["warning"], fg_color=COLORS["warning_soft"], corner_radius=8, font=(FONT, 10)).grid(row=4, column=0, columnspan=2, sticky="ew", pady=(14, 0), ipady=8)
+        self.turnstile_auto_skip_check = self._switch(
+            body,
+            "遇到人机验证自动跳过（不再等待人工操作）",
+            self.turnstile_auto_skip_var,
+        )
+        self.turnstile_auto_skip_check.grid(row=4, column=0, columnspan=2, sticky="w", pady=(14, 0))
+        ctk.CTkLabel(body, text="Outlook 邮箱模式会自动限制为单并发，避免同一邮箱重复占用。", text_color=COLORS["warning"], fg_color=COLORS["warning_soft"], corner_radius=8, font=(FONT, 10)).grid(row=5, column=0, columnspan=2, sticky="ew", pady=(14, 0), ipady=8)
         actions = ctk.CTkFrame(page, fg_color="transparent")
         actions.pack(fill="x", pady=14)
         self.registration_start_btn = self._primary_button(actions, "保存并开始注册", self.start_registration)
@@ -697,6 +704,7 @@ class ModernUIBuilder:
         cfg["enable_nsfw"] = bool(self.nsfw_var.get())
         cfg["browser_minimized"] = bool(self.minimized_var.get())
         cfg["browser_headless"] = bool(self.headless_var.get())
+        cfg["turnstile_auto_skip"] = bool(self.turnstile_auto_skip_var.get())
         cfg["proxy"] = self.proxy_var.get().strip()
         cfg["proxy_pool"] = [dict(item) for item in self.proxy_pool_items]
         cfg["proxy_pool_selected"] = self.proxy_pool_selected_var.get().strip()

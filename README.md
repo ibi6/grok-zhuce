@@ -102,6 +102,9 @@ cp config.example.json config.json
 | `proxy_failure_threshold` | 连续代理连接失败多少次后进入冷却 |
 | `proxy_cooldown_seconds` | 代理故障冷却秒数 |
 | `headless_auto_fallback` | 无头模式遇到 Cloudflare 中间页时，自动切换为最小化窗口模式 |
+| `turnstile_auto_skip` | 检测到需要人工完成的人机验证时，自动跳过当前账号 |
+| `turnstile_skip_cooldown_after` | 连续自动跳过多少次后进入冷却 |
+| `turnstile_skip_cooldown_seconds` | 连续触发后的冷却秒数 |
 | `enable_nsfw` | 注册后是否尝试开启 NSFW |
 | `cloudflare_api_base` | Cloudflare 临时邮箱 API 地址 |
 | `cloudflare_api_key` | Cloudflare 临时邮箱接口密钥；默认匿名模式留空，admin 模式填 `ADMIN_PASSWORD` |
@@ -250,6 +253,7 @@ dist\grok_register_ttk.exe
 - 本地 Token 池和账号输出使用跨进程文件锁，配置与 JSON 池使用原子保存。
 - Outlook OAuth 返回轮换 refresh token 时自动写回原凭证文件。
 - 配置代理后不会因代理失败静默回退直连。
+- 默认检测到人工 Turnstile 后自动跳过；连续触发 3 次后冷却 60 秒。
 
 ## 常见问题
 
@@ -272,6 +276,10 @@ GUI 数量控件可能有上限。CLI 模式直接读取 `config.json` 中的 `r
 ### 为什么无头模式会自动变成最小化窗口？
 
 部分 Cloudflare 页面会直接拦截无头 Chromium，页面中不会出现邮箱注册按钮。默认 `headless_auto_fallback=true`，检测到这种中间页后会自动改用最小化的真实窗口继续。若必须严格保持无头，可在配置中关闭该开关，但注册成功率可能明显下降。
+
+### 为什么程序不再等待我手动做人机验证？
+
+默认 `turnstile_auto_skip=true`。程序确认存在需要人工处理的挑战后，会结束当前账号并继续后续任务，不模拟点击或调用第三方打码服务。关闭该配置可以恢复只观察并等待的旧行为。
 
 ## 目录结构
 

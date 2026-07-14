@@ -85,6 +85,9 @@ DEFAULT_CONFIG = {
     "browser_headless": False,
     "headless_auto_fallback": True,
     "browser_minimized": False,
+    "turnstile_auto_skip": True,
+    "turnstile_skip_cooldown_after": 3,
+    "turnstile_skip_cooldown_seconds": 60,
     "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
     "grok2api_auto_add_local": True,
     "grok2api_local_token_file": "",
@@ -134,6 +137,20 @@ class HeadlessBrowserBlocked(Exception):
     """Raised when headless Chromium receives a Cloudflare interstitial."""
 
     pass
+
+
+class TurnstileAutoSkipped(Exception):
+    """Raised when a visible human-verification challenge is auto-skipped."""
+
+    pass
+
+
+def turnstile_auto_skip_enabled() -> bool:
+    return bool(config.get("turnstile_auto_skip", True))
+
+
+def raise_turnstile_auto_skip(stage="注册流程"):
+    raise TurnstileAutoSkipped(f"{stage}检测到人机验证，已自动跳过")
 
 
 def redact_sensitive_text(text, *extra_secrets):
@@ -2046,9 +2063,16 @@ def open_signup_page(log_callback=None, cancel_callback=None):
             page.get(SIGNUP_URL)
             page.wait.doc_loaded()
             sleep_with_cancel(2, cancel_callback)
-            click_email_signup_button(
-                log_callback=log_callback, cancel_callback=cancel_callback
-            )
+            try:
+                click_email_signup_button(
+                    log_callback=log_callback, cancel_callback=cancel_callback
+                )
+            except HeadlessBrowserBlocked:
+                if turnstile_auto_skip_enabled():
+                    raise_turnstile_auto_skip("注册页")
+                raise
+        elif turnstile_auto_skip_enabled():
+            raise_turnstile_auto_skip("注册页")
         else:
             raise
 
@@ -2500,6 +2524,11 @@ def getTurnstileToken(log_callback=None, cancel_callback=None):
     if page is None:
         raise Exception("页面未就绪，无法执行 Turnstile")
 
+    if turnstile_auto_skip_enabled():
+        if log_callback:
+            log_callback("[!] 检测到人机验证，当前账号将自动跳过")
+        raise_turnstile_auto_skip("资料页")
+
     if log_callback:
         log_callback("[*] 等待页面完成 Cloudflare 验证；如出现验证控件，请在浏览器中手动完成")
 
@@ -2656,6 +2685,8 @@ return 'filled-no-submit';
                 now = time.time()
                 if wait_cf_since is None:
                     wait_cf_since = now
+                if turnstile_auto_skip_enabled() and now - wait_cf_since >= 5:
+                    raise_turnstile_auto_skip("资料页")
                 # 卡住后自动二次复用 Turnstile 组件
                 if now - wait_cf_since >= 12 and now - last_cf_retry_at >= 8:
                     if log_callback:
@@ -2748,6 +2779,8 @@ return 'submitted';
             now = time.time()
             if wait_cf_since is None:
                 wait_cf_since = now
+            if turnstile_auto_skip_enabled() and now - wait_cf_since >= 5:
+                raise_turnstile_auto_skip("资料提交页")
             if now - wait_cf_since >= 12 and now - last_cf_retry_at >= 8:
                 if log_callback:
                     log_callback("[*] 提交前仍卡住，自动再次复用 Turnstile...")
@@ -2800,6 +2833,7 @@ def wait_for_sso_cookie(timeout=120, log_callback=None, cancel_callback=None):
     final_no_submit_state = ""
     final_no_submit_since = None
     final_no_submit_timeout = 25
+    final_cf_since = None
 
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
@@ -2876,9 +2910,14 @@ return 'final-page-clicked-submit';
                 else:
                     final_no_submit_state = ""
                     final_no_submit_since = None
-                if log_callback and isinstance(retried, str) and retried.startswith("final-page-wait-cf"):
+                if isinstance(retried, str) and retried.startswith("final-page-wait-cf"):
                     token_len = retried.split(":", 1)[1] if ":" in retried else "0"
-                    log_callback(f"[Debug] 最终页状态: final-page-wait-cf, token长度={token_len}")
+                    if log_callback:
+                        log_callback(f"[Debug] 最终页状态: final-page-wait-cf, token长度={token_len}")
+                    if final_cf_since is None:
+                        final_cf_since = now
+                    if turnstile_auto_skip_enabled() and now - final_cf_since >= 5:
+                        raise_turnstile_auto_skip("最终注册页")
                     if now - last_cf_retry_at >= 10:
                         if log_callback:
                             log_callback("[*] 最终页 Cloudflare 卡住，自动二次复用 Turnstile...")
@@ -2905,6 +2944,8 @@ return String(cfInput.value || '').trim().length;
                             if log_callback:
                                 log_callback(f"[Debug] 最终页 Turnstile 二次复用失败: {cf_exc}")
                         last_cf_retry_at = now
+                elif not (isinstance(retried, str) and retried.startswith("final-page-wait-cf")):
+                    final_cf_since = None
 
             cookies = page.cookies(all_domains=True, all_info=True) or []
             for item in cookies:
@@ -2925,6 +2966,8 @@ return String(cfInput.value || '').trim().length;
         except PageDisconnectedError:
             refresh_active_page()
         except AccountRetryNeeded:
+            raise
+        except TurnstileAutoSkipped:
             raise
         except Exception:
             pass
@@ -3451,6 +3494,7 @@ class GrokRegisterGUI(ModernUIBuilder):
             i = 0
             retry_count_for_slot = 0
             max_slot_retry = 3
+            turnstile_skip_streak = 0
             while i < count:
                 if self.should_stop():
                     break
@@ -3555,6 +3599,7 @@ class GrokRegisterGUI(ModernUIBuilder):
                     add_token_to_token_only_file(sso, log_callback=self.log)
                     self.success_count += 1
                     mark_task_proxy_success()
+                    turnstile_skip_streak = 0
                     retry_count_for_slot = 0
                     i += 1
                     self.log(f"[+] 注册成功: {email}")
@@ -3567,10 +3612,30 @@ class GrokRegisterGUI(ModernUIBuilder):
                             log_callback=self.log,
                             reason=f"已成功 {self.success_count} 个账号，执行定期清理",
                         )
+                except TurnstileAutoSkipped as exc:
+                    self.fail_count += 1
+                    retry_count_for_slot = 0
+                    turnstile_skip_streak += 1
+                    i += 1
+                    self.log(f"[-] {exc}")
+                    cooldown_after = max(
+                        int(config.get("turnstile_skip_cooldown_after", 3) or 3), 1
+                    )
+                    if turnstile_skip_streak >= cooldown_after and i < count:
+                        cooldown_seconds = max(
+                            int(config.get("turnstile_skip_cooldown_seconds", 60) or 60), 1
+                        )
+                        self.log(
+                            f"[!] 连续 {turnstile_skip_streak} 次触发人机验证，冷却 {cooldown_seconds}s"
+                        )
+                        stop_browser(log_callback=self.log)
+                        sleep_with_cancel(cooldown_seconds, self.should_stop)
+                        turnstile_skip_streak = 0
                 except RegistrationCancelled:
                     self.log("[!] 注册被用户停止")
                     break
                 except AccountRetryNeeded as exc:
+                    turnstile_skip_streak = 0
                     retry_count_for_slot += 1
                     if retry_count_for_slot <= max_slot_retry:
                         self.log(
@@ -3584,6 +3649,7 @@ class GrokRegisterGUI(ModernUIBuilder):
                         retry_count_for_slot = 0
                         i += 1
                 except Exception as exc:
+                    turnstile_skip_streak = 0
                     try:
                         proxy_retry = rotate_task_proxy_after_failure(exc, log_callback=self.log)
                     except NoProxyAvailable as proxy_exc:
@@ -3650,6 +3716,7 @@ def run_registration_cli(
     fail_count = 0
     retry_count_for_slot = 0
     max_slot_retry = 3
+    turnstile_skip_streak = 0
     if not accounts_output_file:
         accounts_output_file = os.path.join(
             _APP_DIR,
@@ -3765,6 +3832,7 @@ def run_registration_cli(
                 add_token_to_token_only_file(sso, log_callback=cli_log)
                 success_count += 1
                 mark_task_proxy_success()
+                turnstile_skip_streak = 0
                 retry_count_for_slot = 0
                 i += 1
                 cli_log(f"[+] 注册成功: {email}")
@@ -3774,10 +3842,30 @@ def run_registration_cli(
                         log_callback=cli_log,
                         reason=f"已成功 {success_count} 个账号，执行定期清理",
                     )
+            except TurnstileAutoSkipped as exc:
+                fail_count += 1
+                retry_count_for_slot = 0
+                turnstile_skip_streak += 1
+                i += 1
+                cli_log(f"[-] {exc}")
+                cooldown_after = max(
+                    int(config.get("turnstile_skip_cooldown_after", 3) or 3), 1
+                )
+                if turnstile_skip_streak >= cooldown_after and i < count:
+                    cooldown_seconds = max(
+                        int(config.get("turnstile_skip_cooldown_seconds", 60) or 60), 1
+                    )
+                    cli_log(
+                        f"[!] 连续 {turnstile_skip_streak} 次触发人机验证，冷却 {cooldown_seconds}s"
+                    )
+                    stop_browser(log_callback=cli_log)
+                    sleep_with_cancel(cooldown_seconds, controller.should_stop)
+                    turnstile_skip_streak = 0
             except RegistrationCancelled:
                 cli_log("[!] 注册被停止")
                 break
             except AccountRetryNeeded as exc:
+                turnstile_skip_streak = 0
                 retry_count_for_slot += 1
                 if retry_count_for_slot <= max_slot_retry:
                     cli_log(
@@ -3789,6 +3877,7 @@ def run_registration_cli(
                     i += 1
                     cli_log(f"[-] 当前账号已达到最大重试次数，跳过: {exc}")
             except Exception as exc:
+                turnstile_skip_streak = 0
                 try:
                     proxy_retry = rotate_task_proxy_after_failure(exc, log_callback=cli_log)
                 except NoProxyAvailable as proxy_exc:

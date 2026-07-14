@@ -37,6 +37,7 @@ def mint_and_export(
     recycle_every: int = 15,
     log: LogFn | None = None,
     cancel: Callable[[], bool] | None = None,
+    turnstile_auto_skip: bool = True,
 ) -> dict[str, Any]:
     """Full pipeline: device-auth → write CPA file → optional probe.
 
@@ -66,6 +67,7 @@ def mint_and_export(
             recycle_every=recycle_every,
             poll_log=log,
             cancel=cancel,
+            turnstile_auto_skip=turnstile_auto_skip,
         )
     except Exception as e:  # noqa: BLE001
         log(f"mint failed: {e}")

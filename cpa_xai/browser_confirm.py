@@ -703,6 +703,30 @@ def _click_exact(
     return None
 
 
+def _visible_turnstile_present(page: Any) -> bool:
+    try:
+        return bool(
+            page.run_js(
+                """
+const nodes = Array.from(document.querySelectorAll(
+  'iframe[src*="turnstile"], div.cf-turnstile, [data-sitekey]'
+));
+return nodes.some((node) => {
+  const style = window.getComputedStyle(node);
+  const rect = node.getBoundingClientRect();
+  return style.display !== 'none'
+    && style.visibility !== 'hidden'
+    && style.opacity !== '0'
+    && rect.width > 0
+    && rect.height > 0;
+});
+                """
+            )
+        )
+    except Exception:
+        return False
+
+
 def _wait_turnstile(
     page: Any,
     log: LogFn,
@@ -711,14 +735,11 @@ def _wait_turnstile(
     email: str = "",
     raise_on_timeout: bool = False,
     cancel: Callable[[], bool] | None = None,
+    auto_skip: bool = True,
 ) -> bool:
-    """Wait/click Cloudflare Turnstile on the mint browser page.
-
-    On timeout: optionally screenshot + raise BrowserConfirmError so backfill
-    skips this account instead of spinning until --timeout.
-    """
-    deadline = time.time() + timeout
-    clicked = False
+    """Observe Turnstile without clicking; auto-skip visible unsolved challenges."""
+    deadline = time.time() + (min(timeout, 5.0) if auto_skip else timeout)
+    challenge_seen = False
     while time.time() < deadline:
         if cancel and cancel():
             raise BrowserConfirmError("cancelled")
@@ -731,66 +752,26 @@ def _wait_turnstile(
                     return True
         except Exception:
             pass
-
-        # Mimic register-machine: shadow-root checkbox click
         try:
-            challenge_input = page.ele("@name=cf-turnstile-response", timeout=0.2)
-            if challenge_input is not None:
-                wrapper = challenge_input.parent()
-                iframe = None
-                try:
-                    iframe = wrapper.shadow_root.ele("tag:iframe")
-                except Exception:
-                    iframe = None
-                if iframe is not None:
-                    try:
-                        iframe.run_js(
-                            """
-window.dtp = 1;
-function getRandomInt(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
-let sx = getRandomInt(800, 1200);
-let sy = getRandomInt(400, 700);
-Object.defineProperty(MouseEvent.prototype, 'screenX', { value: sx });
-Object.defineProperty(MouseEvent.prototype, 'screenY', { value: sy });
-                            """
-                        )
-                    except Exception:
-                        pass
-                    try:
-                        body_sr = iframe.ele("tag:body").shadow_root
-                        btn = body_sr.ele("tag:input")
-                        if btn is not None:
-                            btn.click()
-                            if not clicked:
-                                log("clicked turnstile shadow checkbox")
-                                clicked = True
-                    except Exception:
-                        pass
+            challenge_seen = (
+                challenge_seen
+                or _visible_turnstile_present(page)
+                or _is_turnstile_challenge(_visible_text(page))
+            )
         except Exception:
             pass
-
-        if not clicked:
-            try:
-                page.run_js(
-                    """
-const nodes = Array.from(document.querySelectorAll('div,span,iframe')).filter((n) => {
-  const txt = (n.className || '') + ' ' + (n.id || '') + ' ' + (n.getAttribute?.('src') || '');
-  return String(txt).toLowerCase().includes('turnstile');
-});
-if (nodes.length && typeof nodes[0].click === 'function') nodes[0].click();
-                    """
-                )
-                clicked = True
-                log("clicked turnstile container via JS")
-            except Exception:
-                pass
-        _sleep(0.9)
-    log("turnstile not ready")
+        if not challenge_seen:
+            _sleep(0.5)
+            continue
+        _sleep(0.5)
+    if not challenge_seen:
+        return True
+    log("turnstile challenge remains unsolved")
     shot = _save_debug_shot(page, tag="turnstile-timeout", email=email, log=log)
-    if raise_on_timeout:
-        msg = "turnstile timeout"
-        if shot:
-            msg = f"{msg} shot={shot}"
+    msg = "turnstile required; auto-skipped" if auto_skip else "turnstile timeout"
+    if shot:
+        msg = f"{msg} shot={shot}"
+    if auto_skip or raise_on_timeout:
         raise BrowserConfirmError(f"auth failed: {msg}")
     return False
 
@@ -908,6 +889,7 @@ def approve_device_code(
     stop_event: threading.Event | None = None,
     log: LogFn | None = None,
     cancel: Callable[[], bool] | None = None,
+    turnstile_auto_skip: bool = True,
 ) -> None:
     log = log or _noop_log
     if page is None:
@@ -1106,6 +1088,7 @@ def approve_device_code(
                 email=email,
                 raise_on_timeout=True,
                 cancel=cancel,
+                auto_skip=turnstile_auto_skip,
             )
             _fill(page, "css:input[type='password']", password, log, "password")
             _wait_turnstile(
@@ -1115,6 +1098,7 @@ def approve_device_code(
                 email=email,
                 raise_on_timeout=False,
                 cancel=cancel,
+                auto_skip=turnstile_auto_skip,
             )
             # REAL click login helps form submit
             if not _click_exact(page, ["登录", "Sign in", "Log in"], log, real=True):
@@ -1197,6 +1181,7 @@ def mint_with_browser(
     cookies: Any | None = None,
     reuse_browser: bool = True,
     recycle_every: int = 15,
+    turnstile_auto_skip: bool = True,
 ) -> dict[str, Any]:
     """Request device code, approve in browser, poll tokens.
 
@@ -1297,6 +1282,7 @@ def mint_with_browser(
                 stop_event=stop_event,
                 log=log,
                 cancel=cancel,
+                turnstile_auto_skip=turnstile_auto_skip,
             )
         except BrowserConfirmError as e:
             msg = str(e)

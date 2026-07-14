@@ -132,6 +132,7 @@ def export_cpa_xai_for_account(
     cookie_inject = bool(cfg.get("cpa_mint_cookie_inject", True))
     reuse_browser = bool(cfg.get("cpa_mint_browser_reuse", True))
     recycle_every = int(cfg.get("cpa_mint_browser_recycle_every", 15) or 0)
+    turnstile_auto_skip = bool(cfg.get("turnstile_auto_skip", True))
 
     reuse_page = None if force_standalone else page
 
@@ -192,6 +193,7 @@ def export_cpa_xai_for_account(
         recycle_every=recycle_every,
         log=_log,
         cancel=cancel_callback,
+        turnstile_auto_skip=turnstile_auto_skip,
     )
 
     # Navigate registration browser back to blank after reuse
