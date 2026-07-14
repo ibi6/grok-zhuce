@@ -119,6 +119,12 @@ cp config.example.json config.json
 | `grok2api_auto_add_remote` | 是否写入远端 grok2api |
 | `grok2api_remote_base` | 远端 grok2api 地址，可填站点根地址或 `/admin/api` 管理 API 地址 |
 | `grok2api_remote_app_key` | 远端 grok2api app key |
+| `cpa_management_auto_upload` | CPA 认证生成并探测成功后，是否自动上传到 CPA 管理 API |
+| `cpa_management_base_url` | CPA 根地址、`/v0/management` 地址或完整 auth-files 地址；远程地址必须使用 HTTPS |
+| `cpa_management_key_encrypted` | Windows DPAPI 加密后的 Management Key；不要手工填写明文 |
+| `cpa_management_remember_key` | 是否使用 Windows DPAPI 加密保存 Management Key |
+| `cpa_management_timeout_sec` | CPA 管理请求单次超时秒数，默认 20 |
+| `cpa_management_retry_count` | 网络错误、429 或 5xx 的自动重试次数，默认 3 |
 
 ### Cloudflare 临时邮箱匿名模式（默认）
 
@@ -243,6 +249,27 @@ dist\grok_register_ttk.exe
 
 这些文件包含敏感信息，已被 `.gitignore` 忽略。
 
+## 自动上传到 CPA
+
+在“CPA 与 Token”页面开启“自动上传到 CPA 管理 API”，填写 CPA 地址和 Management Key，然后点击“测试连接”。CPA 服务端需要启用：
+
+```yaml
+remote-management:
+  allow-remote: true
+  secret-key: "请在服务器安全配置"
+```
+
+程序使用官方接口上传认证文件：
+
+```text
+POST /v0/management/auth-files?name=<filename.json>
+Authorization: Bearer <management key>
+```
+
+远程地址必须使用有效 HTTPS 证书；只有本机 `localhost`、`127.0.0.1` 或 `::1` 允许 HTTP。Management Key 可以通过界面使用 Windows DPAPI 加密保存，也可以设置环境变量 `CPA_MANAGEMENT_KEY`。环境变量优先级最高。
+
+上传失败时本地 CPA 认证 JSON 仍会保留，已经注册成功的账号不会因此改判失败。HTTP 401、403 和其他配置错误不会反复重试；网络错误、429 和 5xx 会按配置自动重试。
+
 ## 稳定性机制
 
 - 每个账号结束后重启浏览器。
@@ -286,6 +313,7 @@ GUI 数量控件可能有上限。CLI 模式直接读取 `config.json` 中的 `r
 ```text
 .
 ├── grok_register_ttk.py   # 主程序
+├── cpa_management.py      # CPA 管理 API、DPAPI 密钥保护和上传重试
 ├── proxy_pool.py          # 代理池、健康检测和故障冷却
 ├── safe_io.py             # 原子保存与跨进程文件锁
 ├── cf_mail_debug.py       # Cloudflare 邮箱调试工具

@@ -10,6 +10,13 @@ from typing import Callable
 
 import customtkinter as ctk
 
+from cpa_management import (
+    CPASecretError,
+    configured_management_key,
+    persist_management_key,
+    set_session_management_key,
+    test_connection as test_cpa_management_connection,
+)
 from proxy_pool import ProxyPoolManager, normalize_proxy_entries, parse_proxy_text, redact_proxy_url
 
 
@@ -119,6 +126,21 @@ class ModernUIBuilder:
         self.cpa_probe_after_write_var = tk.BooleanVar(value=bool(cfg.get("cpa_probe_after_write", True)))
         self.cpa_hotload_dir_var = tk.StringVar(value=str(cfg.get("cpa_hotload_dir", "")))
         self.cpa_copy_to_hotload_var = tk.BooleanVar(value=bool(cfg.get("cpa_copy_to_hotload", False)))
+        self.cpa_management_auto_upload_var = tk.BooleanVar(value=bool(cfg.get("cpa_management_auto_upload", False)))
+        self.cpa_management_base_url_var = tk.StringVar(value=str(cfg.get("cpa_management_base_url", "")))
+        self.cpa_management_remember_key_var = tk.BooleanVar(value=bool(cfg.get("cpa_management_remember_key", False)))
+        saved_management_key = ""
+        management_status = "尚未配置 CPA 管理 API"
+        if os.environ.get("CPA_MANAGEMENT_KEY"):
+            management_status = "将优先使用 CPA_MANAGEMENT_KEY 环境变量"
+        elif cfg.get("cpa_management_key_encrypted"):
+            try:
+                saved_management_key = configured_management_key(cfg)
+                management_status = "已加载 DPAPI 加密管理密钥"
+            except CPASecretError:
+                management_status = "已保存密钥无法解密，请重新输入"
+        self.cpa_management_key_var = tk.StringVar(value=saved_management_key)
+        self.cpa_management_status_var = tk.StringVar(value=management_status)
         self.status_var = tk.StringVar(value="就绪")
         self.stats_var = tk.StringVar(value="成功: 0 | 失败: 0")
         self.success_metric_var = tk.StringVar(value="0")
@@ -623,8 +645,93 @@ class ModernUIBuilder:
         f.pack(fill="x", pady=(14, 0))
         self.cpa_copy_to_hotload_check = self._switch(cbody, "同时复制到热加载目录", self.cpa_copy_to_hotload_var)
         self.cpa_copy_to_hotload_check.pack(anchor="w", pady=(14, 0))
+        management = ctk.CTkFrame(cbody, fg_color=COLORS["primary_soft"], corner_radius=12)
+        management.pack(fill="x", pady=(16, 0))
+        mbody = ctk.CTkFrame(management, fg_color="transparent")
+        mbody.pack(fill="x", padx=14, pady=14)
+        self.cpa_management_auto_upload_check = self._switch(
+            mbody,
+            "自动上传到 CPA 管理 API",
+            self.cpa_management_auto_upload_var,
+        )
+        self.cpa_management_auto_upload_check.pack(anchor="w")
+        f, self.cpa_management_base_url_entry = self._field(
+            mbody,
+            "CPA 管理地址",
+            self.cpa_management_base_url_var,
+            placeholder="https://cpa.example.com",
+        )
+        f.pack(fill="x", pady=(14, 0))
+        f, self.cpa_management_key_entry = self._field(
+            mbody,
+            "Management Key",
+            self.cpa_management_key_var,
+            secret=True,
+        )
+        f.pack(fill="x", pady=(14, 0))
+        actions = ctk.CTkFrame(mbody, fg_color="transparent")
+        actions.pack(fill="x", pady=(14, 0))
+        self.cpa_management_remember_key_check = self._switch(
+            actions,
+            "使用 Windows DPAPI 加密保存密钥",
+            self.cpa_management_remember_key_var,
+        )
+        self.cpa_management_remember_key_check.pack(side="left")
+        self.cpa_management_test_btn = ctk.CTkButton(
+            actions,
+            text="测试连接",
+            command=self._test_cpa_management,
+            width=92,
+            height=34,
+            corner_radius=8,
+            fg_color=COLORS["primary"],
+            hover_color=COLORS["primary_hover"],
+        )
+        self.cpa_management_test_btn.pack(side="right")
+        ctk.CTkLabel(
+            mbody,
+            textvariable=self.cpa_management_status_var,
+            text_color=COLORS["muted"],
+            font=(FONT, 10),
+            wraplength=760,
+            justify="left",
+        ).pack(fill="x", pady=(10, 0))
         ctk.CTkLabel(cbody, text="账号文件包含敏感令牌。界面不会显示 Token 内容，导出状态会写入实时日志。", text_color=COLORS["warning"], fg_color=COLORS["warning_soft"], corner_radius=8, font=(FONT, 10)).pack(fill="x", pady=(14, 0), ipady=8)
         return page
+
+    def _test_cpa_management(self):
+        base_url = self.cpa_management_base_url_var.get().strip()
+        explicit_key = self.cpa_management_key_var.get().strip()
+        set_session_management_key(explicit_key)
+        cfg = dict(self.app_config)
+        cfg["cpa_management_base_url"] = base_url
+        self.cpa_management_status_var.set("正在测试 CPA 管理连接…")
+        self.cpa_management_test_btn.configure(state="disabled", text="测试中…")
+
+        def worker():
+            try:
+                result = test_cpa_management_connection(
+                    base_url,
+                    key=explicit_key,
+                    config=cfg,
+                    timeout=max(float(cfg.get("cpa_management_timeout_sec") or 20), 1.0),
+                )
+                self.ui_queue.put(("cpa_management_test", result))
+            except Exception as exc:
+                self.ui_queue.put(("cpa_management_error", str(exc)))
+
+        threading.Thread(target=worker, name="cpa-management-test", daemon=True).start()
+
+    def _apply_cpa_management_test(self, result):
+        self.cpa_management_test_btn.configure(state="normal", text="测试连接")
+        version = str((result or {}).get("version") or "").strip()
+        count = int((result or {}).get("count") or 0)
+        suffix = f" · CPA {version}" if version else ""
+        self.cpa_management_status_var.set(f"连接成功{suffix} · 已读取 {count} 个认证条目")
+
+    def _apply_cpa_management_error(self, error):
+        self.cpa_management_test_btn.configure(state="normal", text="测试连接")
+        self.cpa_management_status_var.set(f"连接失败：{error}")
 
     def _build_settings_page(self):
         page = self._page()
@@ -733,6 +840,18 @@ class ModernUIBuilder:
         cfg["cpa_probe_after_write"] = bool(self.cpa_probe_after_write_var.get())
         cfg["cpa_hotload_dir"] = self.cpa_hotload_dir_var.get().strip()
         cfg["cpa_copy_to_hotload"] = bool(self.cpa_copy_to_hotload_var.get())
+        cfg["cpa_management_auto_upload"] = bool(self.cpa_management_auto_upload_var.get())
+        cfg["cpa_management_base_url"] = self.cpa_management_base_url_var.get().strip()
+        management_key = self.cpa_management_key_var.get().strip()
+        try:
+            persist_management_key(
+                cfg,
+                management_key,
+                remember=bool(self.cpa_management_remember_key_var.get()),
+            )
+        except CPASecretError as exc:
+            self.cpa_management_status_var.set(f"密钥加密失败：{exc}")
+            raise ValueError("CPA Management Key 加密失败") from exc
         try:
             cfg["register_count"] = max(1, int(self.count_var.get()))
         except Exception:
@@ -758,7 +877,7 @@ class ModernUIBuilder:
             widget = getattr(self, name, None)
             if widget:
                 widget.configure(state=state_stop)
-        for name in ("proxy_add_btn", "proxy_import_btn", "proxy_check_btn", "proxy_save_btn"):
+        for name in ("proxy_add_btn", "proxy_import_btn", "proxy_check_btn", "proxy_save_btn", "cpa_management_test_btn"):
             widget = getattr(self, name, None)
             if widget:
                 widget.configure(state=state_start)

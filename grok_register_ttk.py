@@ -32,6 +32,7 @@ os.environ.setdefault("TK_SILENCE_DEPRECATION", "1")
 from DrissionPage import Chromium, ChromiumOptions
 from DrissionPage.errors import PageDisconnectedError
 from curl_cffi import requests
+from cpa_management import resolve_management_key, set_session_management_key
 from outlook_mail import OutlookAuthError, OutlookError, get_pool, redact_secrets, wait_for_verification_code
 from modern_ui import ModernUIBuilder, create_root
 from proxy_pool import (
@@ -108,6 +109,12 @@ DEFAULT_CONFIG = {
     "cpa_mint_browser_recycle_every": 15,
     "cpa_hotload_dir": "",
     "cpa_copy_to_hotload": False,
+    "cpa_management_auto_upload": False,
+    "cpa_management_base_url": "",
+    "cpa_management_key_encrypted": "",
+    "cpa_management_remember_key": False,
+    "cpa_management_timeout_sec": 20,
+    "cpa_management_retry_count": 3,
     "cpa_server_host": "",
     "cpa_server_user": "root",
     "cpa_server_password": "",
@@ -157,7 +164,7 @@ def redact_sensitive_text(text, *extra_secrets):
     secret_values = list(extra_secrets)
     for key, value in config.items():
         key_lower = str(key).lower()
-        is_secret_key = key_lower.endswith(
+        is_secret_key = "management_key" in key_lower or key_lower.endswith(
             ("_password", "_api_key", "_app_key", "_jwt", "_access_token", "_refresh_token")
         ) or key_lower in {"password", "api_key", "app_key", "jwt", "access_token", "refresh_token"}
         if is_secret_key:
@@ -2980,9 +2987,11 @@ def multiprocessing_worker(
     log_queue,
     stop_event=None,
     proxy_runtime_states=None,
+    cpa_management_key="",
 ):
     global config
     config.update(config_data)
+    set_session_management_key(cpa_management_key)
 
     def w_log(message):
         timestamp = datetime.datetime.now().strftime("%H:%M:%S")
@@ -3261,6 +3270,10 @@ class GrokRegisterGUI(ModernUIBuilder):
                     self._apply_proxy_states(event[1])
                 elif kind == "proxy_error":
                     self._apply_proxy_error(event[1])
+                elif kind == "cpa_management_test":
+                    self._apply_cpa_management_test(event[1])
+                elif kind == "cpa_management_error":
+                    self._apply_cpa_management_error(event[1])
         except queue.Empty:
             pass
         try:
@@ -3411,6 +3424,12 @@ class GrokRegisterGUI(ModernUIBuilder):
             url: vars(state).copy()
             for url, state in getattr(self, "_proxy_runtime_states", {}).items()
         }
+        try:
+            cpa_management_key = resolve_management_key(config)
+        except Exception:
+            cpa_management_key = ""
+            if config.get("cpa_management_auto_upload", False):
+                self.log("[!] CPA 管理密钥无法读取；并发任务将仅保留本地认证文件")
 
         for i in range(concurrency):
             c = base + (1 if i < rem else 0)
@@ -3425,6 +3444,7 @@ class GrokRegisterGUI(ModernUIBuilder):
                         self.log_queue,
                         self.mp_stop_event,
                         proxy_runtime_states,
+                        cpa_management_key,
                     ),
                 )
                 p.start()

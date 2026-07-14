@@ -14,6 +14,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
+from cpa_management import upload_auth_file
 from outlook_mail import redact_secrets
 from proxy_pool import redact_proxy_url
 from safe_io import append_text_locked
@@ -217,9 +218,25 @@ def export_cpa_xai_for_account(
             log(f"[cpa] hotload copy failed: {e}")
             result["cpa_copy_error"] = str(e)
 
-    if result.get("ok") and result.get("path") and cfg.get("cpa_server_host"):
+    if result.get("ok") and result.get("path") and cfg.get("cpa_management_auto_upload", False):
+        try:
+            upload_result = upload_auth_file(
+                result["path"],
+                config=cfg,
+                log_callback=log,
+            )
+        except Exception:
+            upload_result = {"ok": False, "error": "CPA 管理上传发生内部错误"}
+            log("[cpa] 管理 API 上传失败，本地认证文件已保留")
+        result["management_upload"] = upload_result
+        if upload_result.get("ok"):
+            result["management_upload_ok"] = True
+        else:
+            result["management_upload_error"] = str(upload_result.get("error") or "上传失败")
+    elif result.get("ok") and result.get("path") and cfg.get("cpa_server_host"):
         try:
             from grok_register_ttk import upload_to_cpa_server
+            log("[cpa] 使用旧 SFTP 兼容模式上传；建议迁移到 CPA 管理 API")
             upload_to_cpa_server(result["path"], log_callback=log)
         except Exception as e:  # noqa: BLE001
             log(f"[cpa] server upload failed: {e}")
