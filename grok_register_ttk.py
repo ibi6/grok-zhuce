@@ -231,11 +231,6 @@ warn_runtime_compatibility()
 
 load_config()
 
-EXTENSION_PATH = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "turnstilePatch")
-)
-
-
 DUCKMAIL_API_BASE = "https://api.duckmail.sbs"
 GPTMAIL_API_BASE = "https://mail.chatgpt.org.uk/api"
 
@@ -781,8 +776,6 @@ def create_browser_options():
     proxy = str(config.get("proxy") or "").strip()
     if proxy:
         options.set_proxy(proxy)
-    if os.path.exists(EXTENSION_PATH):
-        options.add_extension(EXTENSION_PATH)
     if config.get("browser_headless", False):
         options.headless(True)
     elif config.get("browser_minimized", False):
@@ -1927,6 +1920,7 @@ def page_has_cloudflare_interstitial(page_obj=None) -> bool:
         "just a moment",
         "cf-chl-",
         "challenge-platform",
+        "cf-turnstile",
         "verify you are human",
         "checking your browser",
         "enable javascript and cookies",
@@ -3265,6 +3259,8 @@ class GrokRegisterGUI(ModernUIBuilder):
                     self._apply_running_ui(event[1])
                 elif kind == "proxy_states":
                     self._apply_proxy_states(event[1])
+                elif kind == "proxy_error":
+                    self._apply_proxy_error(event[1])
         except queue.Empty:
             pass
         try:

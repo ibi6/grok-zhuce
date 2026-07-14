@@ -505,9 +505,12 @@ class ModernUIBuilder:
         self.proxy_check_btn.configure(state="disabled", text="检测中…")
 
         def worker():
-            manager = ProxyPoolManager.from_config(self.app_config)
-            states = manager.check_all(timeout=8)
-            self.ui_queue.put(("proxy_states", states))
+            try:
+                manager = ProxyPoolManager.from_config(self.app_config)
+                states = manager.check_all(timeout=8)
+                self.ui_queue.put(("proxy_states", states))
+            except Exception as exc:
+                self.ui_queue.put(("proxy_error", str(exc)))
 
         threading.Thread(target=worker, name="proxy-health-check", daemon=True).start()
 
@@ -517,6 +520,10 @@ class ModernUIBuilder:
         self.proxy_pool_summary_var.set(f"检测完成：{healthy}/{len(self.proxy_pool_items)} 个可用")
         self.proxy_check_btn.configure(state="normal", text="检测全部")
         self._refresh_proxy_rows()
+
+    def _apply_proxy_error(self, error):
+        self.proxy_check_btn.configure(state="normal", text="检测全部")
+        self.proxy_pool_summary_var.set(f"代理检测失败：{error}")
 
     def _build_email_page(self):
         page = self._page()

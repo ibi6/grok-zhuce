@@ -18,7 +18,7 @@ Hard rules:
   - Button match is EXACT text only (允许 ≠ 全部允许)
   - Cookie modal must be dismissed before consent Allow
   - Consent Allow MUST be a real click, not by_js
-  - Prefer headed browser + register turnstilePatch
+  - Prefer headed browser and observe challenges without simulated clicks
 """
 
 from __future__ import annotations
@@ -173,7 +173,7 @@ def create_standalone_page(
                 from grok_register_ttk import create_browser_options  # type: ignore
 
                 opts = create_browser_options()
-                log("using register create_browser_options (turnstilePatch)")
+                log("using register browser options")
             except Exception as e:  # noqa: BLE001
                 log(f"register browser options unavailable: {e}")
                 opts = None
@@ -195,14 +195,6 @@ def create_standalone_page(
             "--window-size=1280,900",
         ):
             opts.set_argument(flag)
-        ext = str(_pkg_root / "turnstilePatch")
-        if os.path.isdir(ext):
-            try:
-                opts.add_extension(ext)
-                log(f"added extension {ext}")
-            except Exception as e:  # noqa: BLE001
-                log(f"extension add failed: {e}")
-
     if headless:
         try:
             opts.headless(True)
@@ -740,6 +732,7 @@ def _wait_turnstile(
     """Observe Turnstile without clicking; auto-skip visible unsolved challenges."""
     deadline = time.time() + (min(timeout, 5.0) if auto_skip else timeout)
     challenge_seen = False
+    empty_rounds = 0
     while time.time() < deadline:
         if cancel and cancel():
             raise BrowserConfirmError("cancelled")
@@ -753,11 +746,15 @@ def _wait_turnstile(
         except Exception:
             pass
         try:
-            challenge_seen = (
-                challenge_seen
-                or _visible_turnstile_present(page)
-                or _is_turnstile_challenge(_visible_text(page))
-            )
+            visible_challenge = _visible_turnstile_present(page)
+            text_challenge = _is_turnstile_challenge(_visible_text(page))
+            challenge_seen = challenge_seen or visible_challenge or text_challenge
+            if not challenge_seen:
+                empty_rounds += 1
+                if empty_rounds >= 3:
+                    return True
+            else:
+                empty_rounds = 0
         except Exception:
             pass
         if not challenge_seen:

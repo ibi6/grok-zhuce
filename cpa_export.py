@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from outlook_mail import redact_secrets
+from proxy_pool import redact_proxy_url
 from safe_io import append_text_locked
 
 if getattr(sys, 'frozen', False):
@@ -168,7 +169,7 @@ def export_cpa_xai_for_account(
 
     out_dir.mkdir(parents=True, exist_ok=True)
     log(
-        f"[cpa] mint OIDC for {email} -> {out_dir} proxy={proxy or '(none)'} "
+        f"[cpa] mint OIDC for {email} -> {out_dir} proxy={redact_proxy_url(proxy) or '(none)'} "
         f"cookies={len(use_cookies) if isinstance(use_cookies, list) else (1 if use_cookies else 0)} "
         f"reuse={reuse_browser}"
     )

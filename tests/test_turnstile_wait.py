@@ -65,6 +65,37 @@ class TurnstileWaitTests(unittest.TestCase):
         self.assertNotIn("MouseEvent.prototype", segment)
         self.assertNotIn(".click()", segment)
 
+    def test_cpa_no_challenge_returns_without_full_timeout(self):
+        from cpa_xai.browser_confirm import _wait_turnstile
+
+        class NoChallengePage:
+            def ele(self, *args, **kwargs):
+                return None
+
+            def run_js(self, script, *args):
+                if "document.body" in script:
+                    return ""
+                return False
+
+        with patch("cpa_xai.browser_confirm._sleep", return_value=None):
+            self.assertTrue(
+                _wait_turnstile(
+                    NoChallengePage(),
+                    lambda _: None,
+                    timeout=45,
+                    auto_skip=True,
+                )
+            )
+
+    def test_turnstile_patch_extension_is_not_loaded(self):
+        from pathlib import Path
+
+        root = Path(__file__).resolve().parents[1]
+        source = (root / "grok_register_ttk.py").read_text(encoding="utf-8")
+        cpa_source = (root / "cpa_xai" / "browser_confirm.py").read_text(encoding="utf-8")
+        self.assertNotIn("turnstilePatch", source)
+        self.assertNotIn("add_extension", cpa_source)
+
 
 if __name__ == "__main__":
     unittest.main()
