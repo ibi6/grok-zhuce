@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Any, Iterable
 from urllib.parse import urlparse, urlunparse
@@ -287,8 +288,28 @@ class ProxyPoolManager:
         state.last_checked = time.time()
         return state
 
-    def check_all(self, *, session=requests, timeout: float = 8.0) -> dict[str, ProxyRuntimeState]:
-        for entry in self.entries:
-            if entry["enabled"]:
-                self.check(entry["url"], session=session, timeout=timeout)
+    def check_all(
+        self,
+        *,
+        session=requests,
+        timeout: float = 8.0,
+        max_workers: int = 8,
+    ) -> dict[str, ProxyRuntimeState]:
+        enabled_urls = [entry["url"] for entry in self.entries if entry["enabled"]]
+        if not enabled_urls:
+            return self.states
+
+        worker_count = min(max(int(max_workers), 1), len(enabled_urls))
+        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="proxy-check") as executor:
+            futures = {
+                executor.submit(self.check, url, session=session, timeout=timeout): url
+                for url in enabled_urls
+            }
+            for future in as_completed(futures):
+                url = futures[future]
+                try:
+                    future.result()
+                except Exception as exc:
+                    self.mark_failure(url, exc)
+                    self.states[url].last_checked = time.time()
         return self.states

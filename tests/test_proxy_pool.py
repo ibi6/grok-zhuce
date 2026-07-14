@@ -1,4 +1,5 @@
 import unittest
+import threading
 from unittest.mock import Mock
 
 from proxy_pool import (
@@ -118,6 +119,67 @@ class ProxyPoolTests(unittest.TestCase):
                 "http://127.0.0.1:7897",
             )
         )
+
+    def test_check_all_runs_enabled_proxies_concurrently(self):
+        barrier = threading.Barrier(2)
+        lock = threading.Lock()
+        active = 0
+        max_active = 0
+
+        class ConcurrentSession:
+            @staticmethod
+            def get(*args, **kwargs):
+                nonlocal active, max_active
+                with lock:
+                    active += 1
+                    max_active = max(max_active, active)
+                try:
+                    barrier.wait(timeout=1)
+                    return Mock(status_code=200)
+                finally:
+                    with lock:
+                        active -= 1
+
+        manager = ProxyPoolManager([
+            "http://127.0.0.1:7897",
+            "http://127.0.0.1:7898",
+        ])
+        states = manager.check_all(session=ConcurrentSession(), timeout=1, max_workers=2)
+
+        self.assertEqual(max_active, 2)
+        self.assertTrue(all(state.healthy for state in states.values()))
+
+    def test_check_all_skips_disabled_proxies(self):
+        session = Mock()
+        session.get.return_value = Mock(status_code=200)
+        manager = ProxyPoolManager([
+            {"url": "http://127.0.0.1:7897", "enabled": True},
+            {"url": "http://127.0.0.1:7898", "enabled": False},
+        ])
+
+        states = manager.check_all(session=session)
+
+        self.assertEqual(session.get.call_count, 1)
+        self.assertTrue(states["http://127.0.0.1:7897"].healthy)
+        self.assertIsNone(states["http://127.0.0.1:7898"].healthy)
+
+    def test_check_all_isolates_individual_proxy_failures(self):
+        class MixedSession:
+            @staticmethod
+            def get(url, *, proxies, **kwargs):
+                if proxies["https"].endswith(":7897"):
+                    raise OSError("connection refused")
+                return Mock(status_code=403)
+
+        manager = ProxyPoolManager([
+            "http://127.0.0.1:7897",
+            "http://127.0.0.1:7898",
+        ])
+
+        states = manager.check_all(session=MixedSession(), max_workers=2)
+
+        self.assertFalse(states["http://127.0.0.1:7897"].healthy)
+        self.assertTrue(states["http://127.0.0.1:7898"].healthy)
 
 
 if __name__ == "__main__":
