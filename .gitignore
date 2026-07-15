@@ -1,6 +1,8 @@
 __pycache__/
 build/
 dist/
+build_api/
+dist_api/
 *.pyc
 *.pyo
 *.pyd
@@ -19,6 +21,7 @@ screenshots/
 
 config.json
 config.local.json
+cpa_reauth_batch.py
 
 *.log
 .DS_Store
